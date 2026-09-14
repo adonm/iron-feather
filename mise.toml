@@ -1,0 +1,5 @@
+# Toolchain pins. Activate with `mise install` (auto-installs on first run).
+[tools]
+just = "1"
+# Optional: DuckDB CLI for poking at shard files.
+# duckdb = "1.5.5"

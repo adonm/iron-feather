@@ -1,0 +1,14 @@
+direction: down
+title: iron-feather v0 - one shard over Flight (+ Poem OGC)
+
+client: PyArrow client (DoGet ticket)
+flight: Flight server (this repo, serve)
+duckdb: DuckDB prebuilt lib
+http: HTTP Parquet (OSM slice)
+poem: Poem OGC API (same lineage core)
+demo: demo.duckdb (same slice, local)
+
+client -> flight: ticket JSON
+flight -> duckdb: SQL + lineage + bbox
+duckdb -> http: range scans
+poem -> demo: local shard file

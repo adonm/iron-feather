@@ -1,0 +1,63 @@
+[package]
+name = "iron-feather"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "TiPG-esque OGC API Features + vector tiles + raw Arrow Flight over DuckDB shards"
+repository = "https://github.com/adonm/iron-feather"
+rust-version = "1.85"
+
+[features]
+default = []
+# Full backends. DuckDB links PREBUILT libduckdb (no C++ compile,
+# no bindgen): run `just setup-duckdb` once, or let the build script
+# auto-download the matching release (see README).
+serve = [
+    "dep:duckdb",
+    "dep:libsql",
+    "dep:moka",
+    "dep:tonic",
+    "dep:arrow-flight",
+    "dep:arrow",
+    "dep:tokio-stream",
+    "dep:futures",
+]
+
+[dependencies]
+poem = { version = "3", features = ["server"] }
+poem-openapi = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Martin tile math as a library (bbox, tile coords). Full martin-core
+# sources (PG auto-publish etc.) graduate in behind another feature flag.
+martin-tile-utils = "0.7"
+
+# Prebuilt binaries only: `default-features = false` guarantees the `bundled`
+# C++ build never kicks in. Linked lib comes from $DUCKDB_LIB_DIR
+# (`just setup-duckdb`) or the build-script auto-download.
+duckdb = { version = "1.10505", optional = true, default-features = false }
+libsql = { version = "0.9", optional = true }
+moka = { version = "0.12", features = ["future"], optional = true }
+tonic = { version = "0.14", optional = true }
+arrow-flight = { version = "59", optional = true }
+arrow = { version = "59", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+futures = { version = "0.3", optional = true }
+
+[[bin]]
+name = "iron-feather-fixture"
+path = "src/bin/fixture.rs"
+required-features = ["serve"]
+
+[[example]]
+name = "flight_client"
+required-features = ["serve"]
+
+[[example]]
+name = "flight_bench"
+required-features = ["serve"]
