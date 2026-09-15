@@ -1,12 +1,12 @@
-//! Minimal Flight client proving the standalone fast path.
+//! Minimal Flight client reading the same shard as the OGC API.
 //!
 //! ```sh
-//! just run-serve # in another shell, with --shard-source pointing at parquet
-//! cargo run --locked --features serve --example flight_client
+//! just run fixtures/osm.duckdb # in another shell
+//! cargo run --locked --example flight_client
 //! ```
 
 use arrow_flight::{flight_service_client::FlightServiceClient, Ticket};
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,8 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = FlightServiceClient::new(channel);
     let ticket = serde_json::json!({
         "collection": "buildings",
-        "bbox": [-87.35, 13.95, -87.05, 14.2],
-        "columns": ["id", "x", "y", "name"],
+        "columns": ["id", "geometry", "properties"],
         "limit": 1000,
         "sources": [1],
     });

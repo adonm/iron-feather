@@ -1,105 +1,129 @@
-//! Load generator for the Flight fast path: N concurrent tasks hammering
-//! `DoGet` with the same (hot) or jittered (cold) ticket.
-//!
-//! ```sh
-//! # shell 1: cargo run --features serve -- --shard-source ./fixtures/osm-buildings.parquet
-//! # shell 2: just bench-flight            # or: ADDR=.. CONC=64 REQ=200 just bench-flight
-//! ```
-//!
-//! Reports client-observed rps + p50/p99. Loopback numbers validate the
-//! serving stack (pool, moka L1, Turso L2, Arrow encode); size the network
-//! separately for production rps claims.
+//! Closed-loop Flight benchmark. Counts overload/errors separately from
+//! successful queries and decodes the entire response (including geometry).
+use arrow_flight::{
+    decode::FlightRecordBatchStream, flight_service_client::FlightServiceClient, Ticket,
+};
+use futures::TryStreamExt;
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use arrow_flight::{flight_service_client::FlightServiceClient, Ticket};
-use futures::{StreamExt, TryStreamExt};
-use std::{sync::Arc, time::Instant};
-
-#[derive(clap::Parser, Debug, Clone)]
-#[command(name = "flight_bench", about = "Hammer Flight DoGet, report rps")]
+#[derive(clap::Parser, Debug)]
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:50051")]
     addr: String,
     #[arg(long, default_value_t = 32)]
     concurrency: usize,
-    /// Requests per task (total = concurrency * requests).
     #[arg(long, default_value_t = 100)]
     requests: usize,
-    /// Offset each request's bbox slightly so every query misses the cache.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     jitter: bool,
     #[arg(long, default_value_t = 1000)]
     limit: u32,
+    #[arg(
+        long,
+        num_args = 4,
+        value_delimiter = ',',
+        allow_hyphen_values = true,
+        default_value = "13.35,52.48,13.45,52.55"
+    )]
+    bbox: Vec<f64>,
 }
 
-async fn one(
+#[derive(Default)]
+struct Stats {
+    latencies: Vec<Duration>,
+    statuses: BTreeMap<String, usize>,
+    rows: usize,
+    bytes: usize,
+}
+
+async fn worker(
     mut client: FlightServiceClient<tonic::transport::Channel>,
     task: usize,
     args: Arc<Args>,
-) -> Vec<std::time::Duration> {
-    let mut latencies = Vec::with_capacity(args.requests);
+) -> Stats {
+    let mut stats = Stats::default();
     for i in 0..args.requests {
         let dx = if args.jitter {
-            (task * args.requests + i) as f64 * 0.0001
+            (task * args.requests + i) as f64 * 1e-8
         } else {
             0.0
         };
-        let ticket = serde_json::json!({
-            "collection": "buildings",
-            "bbox": [-87.35 + dx, 13.95, -87.05 + dx, 14.2],
-            "columns": ["id", "x", "y", "name"],
-            "limit": args.limit,
-            "sources": [1, 2, 3],
-        });
-        let request = tonic::Request::new(Ticket {
-            ticket: ticket.to_string().into_bytes().into(),
-        });
+        let ticket = serde_json::json!({"collection": "buildings", "sources": [1], "limit": args.limit,
+            "bbox": [args.bbox[0] + dx, args.bbox[1], args.bbox[2] + dx, args.bbox[3]]});
         let start = Instant::now();
-        let stream = client
-            .do_get(request)
-            .await
-            .expect("do_get")
-            .into_inner()
-            .map_err(arrow_flight::error::FlightError::from);
-        let mut batches =
-            arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream);
-        let mut rows = 0usize;
-        while let Some(batch) = batches.try_next().await.expect("batch") {
-            rows += batch.num_rows();
+        let result = async {
+            let stream = client
+                .do_get(Ticket::new(ticket.to_string()))
+                .await
+                .map_err(|e| format!("{:?}", e.code()))?
+                .into_inner()
+                .map_err(arrow_flight::error::FlightError::from);
+            let mut stream = FlightRecordBatchStream::new_from_flight_data(stream);
+            let (mut rows, mut bytes) = (0, 0);
+            while let Some(batch) = stream
+                .try_next()
+                .await
+                .map_err(|_| "stream_error".to_string())?
+            {
+                rows += batch.num_rows();
+                bytes += batch.get_array_memory_size();
+            }
+            Ok::<_, String>((rows, bytes))
         }
-        std::hint::black_box(rows);
-        latencies.push(start.elapsed());
+        .await;
+        let status = match result {
+            Ok((rows, bytes)) => {
+                stats.latencies.push(start.elapsed());
+                stats.rows += rows;
+                stats.bytes += bytes;
+                "OK".to_string()
+            }
+            Err(status) => status,
+        };
+        *stats.statuses.entry(status).or_default() += 1;
     }
-    latencies
+    stats
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Arc::new(<Args as clap::Parser>::parse());
-    let start = Instant::now();
-    let mut handles = Vec::with_capacity(args.concurrency);
-    for task in 0..args.concurrency {
-        let channel = tonic::transport::Endpoint::from_shared(args.addr.clone())?
+    if args.concurrency == 0 || args.requests == 0 {
+        return Err("concurrency and requests must be positive".into());
+    }
+    let client = FlightServiceClient::new(
+        tonic::transport::Endpoint::from_shared(args.addr.clone())?
             .connect()
-            .await?;
-        let client = FlightServiceClient::new(channel);
-        let args = args.clone();
-        handles.push(tokio::spawn(async move { one(client, task, args).await }));
-    }
-    let mut all = Vec::new();
-    for handle in handles {
-        all.extend(handle.await?);
-    }
-    all.sort_unstable();
-    let total = all.len() as f64;
-    let secs = start.elapsed().as_secs_f64();
-    let pct = |p: f64| all[(total * p).min(total - 1.0) as usize];
-    println!(
-        "requests={} secs={:.2} rps={:.0} p50={:?} p99={:?}",
-        all.len(),
-        secs,
-        total / secs,
-        pct(0.5),
-        pct(0.99)
+            .await?,
     );
+    let start = Instant::now();
+    let workers =
+        (0..args.concurrency).map(|task| tokio::spawn(worker(client.clone(), task, args.clone())));
+    let mut total = Stats::default();
+    for stats in futures::future::join_all(workers).await {
+        let stats = stats?;
+        total.latencies.extend(stats.latencies);
+        total.rows += stats.rows;
+        total.bytes += stats.bytes;
+        for (status, count) in stats.statuses {
+            *total.statuses.entry(status).or_default() += count;
+        }
+    }
+    let secs = start.elapsed().as_secs_f64();
+    total.latencies.sort_unstable();
+    let pct = |p: f64| {
+        total
+            .latencies
+            .get((total.latencies.len() as f64 * p) as usize)
+            .copied()
+            .unwrap_or_default()
+    };
+    println!("requests={} secs={secs:.2} success_rps={:.0} p50={:?} p99={:?} rows={} arrow_MB/s={:.1} statuses={:?}",
+        args.concurrency * args.requests, total.latencies.len() as f64 / secs, pct(0.5), pct(0.99),
+        total.rows, total.bytes as f64 / secs / 1e6, total.statuses);
     Ok(())
 }

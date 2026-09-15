@@ -1,14 +1,15 @@
 direction: down
-title: iron-feather v0 - one shard over Flight (+ Poem OGC)
+source: Layercake GeoParquet (HTTPS)
+build: iron-feather build
+shard: Immutable DuckDB (features + R-tree + id ART)
+remote: Optional HTTP/S3 read-only attachment
+pool: Shared read-only connection pool
+http: OGC Features + XYZ MVT (cached bytes)
+flight: Arrow Flight (cached native Arrow batches)
 
-client: PyArrow client (DoGet ticket)
-flight: Flight server (this repo, serve)
-duckdb: DuckDB prebuilt lib
-http: HTTP Parquet (OSM slice)
-poem: Poem OGC API (same lineage core)
-demo: demo.duckdb (same slice, local)
-
-client -> flight: ticket JSON
-flight -> duckdb: SQL + lineage + bbox
-duckdb -> http: range scans
-poem -> demo: local shard file
+source -> build: bbox-pruned range reads
+build -> shard: atomic publication
+shard -> pool
+remote -> shard: range GETs
+pool -> http
+pool -> flight

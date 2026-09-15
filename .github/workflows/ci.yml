@@ -12,4 +12,3 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: just fmt-check check test
-      - run: just check-serve test-serve

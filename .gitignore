@@ -5,3 +5,4 @@
 *.db-journal
 *.db-wal
 .env
+/.oy

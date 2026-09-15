@@ -1,302 +1,347 @@
-//! OGC API Features surface: landing, conformance, collections, items.
-//!
-//! The OpenAPI contract is derived by `poem-openapi` and served at `/api`
-//! (TiPG-style). Tiles live on plain-Poem routes in [`crate::tiles`] so the
-//! MVT content type is set exactly.
+//! OGC API Features Core / GeoJSON / OpenAPI 3.0 over the shared shard.
 
 use crate::{
     filter,
-    store::{ItemQuery, Store, StoreError},
+    store::{Error, Store},
 };
-use poem_openapi::{
-    param::{Path, Query},
-    payload::Json,
-    ApiResponse, Object, OpenApi,
+use bytes::Bytes;
+use poem::{
+    get, handler,
+    http::{header, StatusCode},
+    web::{Data, Path, Query},
+    EndpointExt, Request, Response, Route,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::sync::Arc;
 
-pub const CONFORMANCE_CLASSES: [&str; 3] = [
+pub const GEOJSON: &str = "application/geo+json";
+pub const CONFORMANCE: [&str; 3] = [
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
 ];
 
-#[derive(Object, Clone, Debug)]
-pub struct Link {
-    pub href: String,
-    pub rel: String,
-    #[oai(rename = "type")]
-    pub media_type: Option<String>,
-    pub title: Option<String>,
+pub fn routes(store: Arc<Store>) -> impl poem::Endpoint {
+    Route::new()
+        .at("/", get(landing))
+        .at("/conformance", get(conformance))
+        .at("/api", get(spec))
+        .at("/api.html", get(documentation))
+        .at("/healthz", get(health))
+        .at("/collections", get(collections))
+        .at("/collections/:collection", get(collection_metadata))
+        .at("/collections/:collection/items", get(items))
+        .at("/collections/:collection/items/:id", get(item))
+        .at(
+            "/collections/:collection/tiles/:z/:x/:y",
+            get(crate::tiles::tile),
+        )
+        .data(store)
 }
 
-impl Link {
-    fn new(href: &str, rel: &str, media_type: Option<&str>, title: Option<&str>) -> Self {
-        Self {
-            href: href.to_string(),
-            rel: rel.to_string(),
-            media_type: media_type.map(str::to_string),
-            title: title.map(str::to_string),
+impl poem::error::ResponseError for Error {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Invalid(_) => StatusCode::BAD_REQUEST,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Overloaded => StatusCode::TOO_MANY_REQUESTS,
+            Self::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
-}
-
-#[derive(Object, Clone, Debug)]
-pub struct Landing {
-    pub title: String,
-    pub description: String,
-    pub links: Vec<Link>,
-}
-
-#[derive(Object, Clone, Debug)]
-pub struct Conformance {
-    #[oai(rename = "conformsTo")]
-    pub conforms_to: Vec<String>,
-}
-
-#[derive(Object, Clone, Debug)]
-pub struct CollectionMeta {
-    pub id: String,
-    pub title: String,
-    pub description: Option<String>,
-    #[oai(rename = "itemType")]
-    pub item_type: String,
-    pub links: Vec<Link>,
-}
-
-#[derive(Object, Clone, Debug)]
-pub struct Collections {
-    pub collections: Vec<CollectionMeta>,
-    pub links: Vec<Link>,
-}
-
-#[derive(Object, Clone, Debug)]
-pub struct Geometry {
-    #[oai(rename = "type")]
-    pub kind: String,
-    pub coordinates: Vec<f64>,
-}
-
-#[derive(Object, Clone, Debug)]
-pub struct Feature {
-    #[oai(rename = "type")]
-    pub kind: String,
-    pub id: String,
-    pub geometry: Option<Geometry>,
-    pub properties: BTreeMap<String, String>,
-}
-
-#[derive(Object, Clone, Debug)]
-pub struct FeatureCollection {
-    #[oai(rename = "type")]
-    pub kind: String,
-    pub features: Vec<Feature>,
-    pub links: Vec<Link>,
-    // NOTE: `numberMatched` deliberately omitted. OGC Core permits omission
-    // and exact total counts are the most expensive part of a page.
-    #[oai(rename = "numberReturned")]
-    pub number_returned: i64,
-}
-
-#[derive(Object, Clone, Debug)]
-pub struct ErrorBody {
-    pub code: String,
-    pub description: String,
-}
-
-impl ErrorBody {
-    fn new(code: &str, description: impl Into<String>) -> Self {
-        Self {
-            code: code.to_string(),
-            description: description.into(),
-        }
-    }
-}
-
-#[derive(ApiResponse)]
-pub enum CollectionResponse {
-    #[oai(status = 200)]
-    Ok(Json<CollectionMeta>),
-    #[oai(status = 404)]
-    NotFound(Json<ErrorBody>),
-    #[oai(status = 500)]
-    Internal(Json<ErrorBody>),
-}
-
-#[derive(ApiResponse)]
-pub enum ItemsResponse {
-    #[oai(status = 200)]
-    Ok(Json<FeatureCollection>),
-    #[oai(status = 400)]
-    BadRequest(Json<ErrorBody>),
-    #[oai(status = 404)]
-    NotFound(Json<ErrorBody>),
-    #[oai(status = 500)]
-    Internal(Json<ErrorBody>),
-}
-
-#[derive(ApiResponse)]
-pub enum ItemResponse {
-    #[oai(status = 200)]
-    Ok(Json<Feature>),
-    #[oai(status = 404)]
-    NotFound(Json<ErrorBody>),
-    #[oai(status = 500)]
-    Internal(Json<ErrorBody>),
-}
-
-#[derive(Clone)]
-pub struct Api {
-    pub store: Arc<Store>,
-    pub serving_version: String,
-}
-
-fn backend_error(e: StoreError) -> (String, String) {
-    match e {
-        StoreError::NotFound(id) => ("not-found".to_string(), format!("unknown collection: {id}")),
-        // No Retry-After on JSON errors (ApiResponse can't set headers);
-        // clients must back off on code == "overloaded". Tiles use 503.
-        StoreError::Overloaded => (
-            "overloaded".to_string(),
-            "server shedding load; retry".to_string(),
-        ),
-        StoreError::Backend(msg) => ("backend".to_string(), msg),
-    }
-}
-
-#[OpenApi]
-impl Api {
-    #[oai(path = "/", method = "get")]
-    async fn landing(&self) -> Json<Landing> {
-        Json(Landing {
-            title: "Iron Feather".to_string(),
-            description: "TiPG-esque OGC Features + tiles over DuckDB shards.".to_string(),
-            links: vec![
-                Link::new("/", "self", Some("application/json"), Some("landing")),
-                Link::new(
-                    "/api",
-                    "service-desc",
-                    Some("application/json"),
-                    Some("OpenAPI contract"),
-                ),
-                Link::new(
-                    "/conformance",
-                    "conformance",
-                    Some("application/json"),
-                    Some("conformance"),
-                ),
-                Link::new(
-                    "/collections",
-                    "data",
-                    Some("application/json"),
-                    Some("collections"),
-                ),
-            ],
-        })
-    }
-
-    #[oai(path = "/conformance", method = "get")]
-    async fn conformance(&self) -> Json<Conformance> {
-        Json(Conformance {
-            conforms_to: CONFORMANCE_CLASSES.iter().map(|s| s.to_string()).collect(),
-        })
-    }
-
-    #[oai(path = "/collections", method = "get")]
-    async fn collections(&self) -> Json<Collections> {
-        let collections = self.store.collections().await.unwrap_or_default();
-        Json(Collections {
-            collections,
-            links: vec![Link::new(
-                "/collections",
-                "self",
-                Some("application/json"),
-                None,
-            )],
-        })
-    }
-
-    #[oai(path = "/collections/:collection_id", method = "get")]
-    async fn collection(&self, collection_id: Path<String>) -> CollectionResponse {
-        match self.store.collection(&collection_id.0).await {
-            Ok(meta) => CollectionResponse::Ok(Json(meta)),
-            Err(StoreError::NotFound(id)) => CollectionResponse::NotFound(Json(ErrorBody::new(
-                "not-found",
-                format!("unknown collection: {id}"),
-            ))),
-            Err(e) => {
-                let (code, description) = backend_error(e);
-                CollectionResponse::Internal(Json(ErrorBody::new(&code, description)))
-            }
-        }
-    }
-
-    #[oai(path = "/collections/:collection_id/items", method = "get")]
-    #[allow(clippy::too_many_arguments)]
-    async fn items(
-        &self,
-        collection_id: Path<String>,
-        bbox: Query<Option<String>>,
-        limit: Query<Option<u32>>,
-        offset: Query<Option<u32>>,
-        datetime: Query<Option<String>>,
-        filter: Query<Option<String>>,
-        properties: Query<Option<String>>,
-        sources: Query<Option<String>>,
-    ) -> ItemsResponse {
-        let bbox = match bbox.0.as_deref().map(filter::parse_bbox).transpose() {
-            Ok(b) => b,
-            Err(e) => {
-                return ItemsResponse::BadRequest(Json(ErrorBody::new("bad-bbox", e)));
-            }
+    fn as_response(&self) -> Response {
+        let description = if matches!(self, Self::Backend(_)) {
+            tracing::error!(error = %self, "shard query failed");
+            "shard query failed".into()
+        } else {
+            self.to_string()
         };
-        let query = ItemQuery {
-            bbox,
-            limit: limit.0.unwrap_or(10).min(1000),
-            offset: offset.0.unwrap_or(0),
-            datetime: datetime.0,
-            filter: filter.0,
-            properties: properties.0,
-            // DEV STAND-IN: comma-separated source ids. Absent/empty matches
-            // nothing (secure default). Prod replaces this with a JWT/OIDC
-            // Bearer securityScheme injecting the caller's lineage set.
-            source_ids: filter::parse_source_list(sources.0.as_deref()),
-        };
-        match self.store.items(&collection_id.0, &query).await {
-            Ok(fc) => ItemsResponse::Ok(Json(fc)),
-            Err(StoreError::NotFound(id)) => ItemsResponse::NotFound(Json(ErrorBody::new(
-                "not-found",
-                format!("unknown collection: {id}"),
-            ))),
-            Err(e) => {
-                let (code, description) = backend_error(e);
-                ItemsResponse::Internal(Json(ErrorBody::new(&code, description)))
-            }
+        let mut response =
+            json_response(json!({"code": self.status().as_u16(), "description": description}));
+        response.set_status(self.status());
+        if matches!(self, Self::Overloaded) {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, "1".parse().unwrap());
         }
+        response
     }
+}
 
-    #[oai(path = "/collections/:collection_id/items/:feature_id", method = "get")]
-    async fn item(
-        &self,
-        collection_id: Path<String>,
-        feature_id: Path<String>,
-        sources: Query<Option<String>>,
-    ) -> ItemResponse {
-        let source_ids = filter::parse_source_list(sources.0.as_deref());
-        match self
-            .store
-            .item(&collection_id.0, &feature_id.0, &source_ids)
-            .await
-        {
-            Ok(feature) => ItemResponse::Ok(Json(feature)),
-            Err(StoreError::NotFound(id)) => ItemResponse::NotFound(Json(ErrorBody::new(
-                "not-found",
-                format!("not found: {id}"),
-            ))),
-            Err(e) => {
-                let (code, description) = backend_error(e);
-                ItemResponse::Internal(Json(ErrorBody::new(&code, description)))
-            }
+pub fn response(bytes: Bytes, content_type: &str) -> Response {
+    Response::builder()
+        .content_type(content_type)
+        .header(header::VARY, "Accept, X-Source-Ids")
+        .body(bytes)
+}
+fn json_response(value: Value) -> Response {
+    response(Bytes::from(value.to_string()), "application/json")
+}
+fn link(href: &str, rel: &str, kind: &str) -> Value {
+    json!({"href": href, "rel": rel, "type": kind})
+}
+fn metadata(id: &str) -> Value {
+    json!({"id": id, "title": id, "itemType": "feature", "links": [
+        link(&format!("/collections/{id}"), "self", "application/json"),
+        link(&format!("/collections/{id}/items"), "items", GEOJSON)
+    ]})
+}
+
+#[handler]
+fn landing(Query(_): Query<NoQuery>) -> Response {
+    json_response(
+        json!({"title": "Iron Feather", "description": "OGC Features and Arrow Flight over a DuckDB shard", "links": [
+            link("/", "self", "application/json"), link("/api", "service-desc", "application/vnd.oai.openapi+json;version=3.0"),
+            link("/api.html", "service-doc", "text/html"), link("/conformance", "conformance", "application/json"), link("/collections", "data", "application/json")
+        ]}),
+    )
+}
+#[handler]
+fn conformance(Query(_): Query<NoQuery>) -> Response {
+    json_response(json!({"conformsTo": CONFORMANCE}))
+}
+#[handler]
+fn health(Query(_): Query<NoQuery>) -> &'static str {
+    "ok"
+}
+#[handler]
+fn spec(Query(_): Query<NoQuery>) -> Response {
+    response(
+        Bytes::from_static(include_bytes!("../docs/openapi.json")),
+        "application/vnd.oai.openapi+json;version=3.0",
+    )
+}
+#[handler]
+fn documentation(Query(_): Query<NoQuery>) -> Response {
+    response(
+        Bytes::from_static(include_bytes!("../docs/api.html")),
+        "text/html",
+    )
+}
+#[handler]
+fn collections(Query(_): Query<NoQuery>, Data(store): Data<&Arc<Store>>) -> Response {
+    json_response(
+        json!({"collections": store.collections.iter().map(|id| metadata(id)).collect::<Vec<_>>(),
+        "links": [link("/collections", "self", "application/json")]}),
+    )
+}
+#[handler]
+fn collection_metadata(
+    Path(id): Path<String>,
+    Query(_): Query<NoQuery>,
+    Data(store): Data<&Arc<Store>>,
+) -> Result<Response, Error> {
+    store.collection(&id)?;
+    Ok(json_response(metadata(&id)))
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ItemsQuery {
+    bbox: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+    datetime: Option<String>,
+    sources: Option<String>,
+}
+fn default_limit() -> u32 {
+    10
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoQuery {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceQuery {
+    pub sources: Option<String>,
+}
+
+pub fn source_ids(req: &Request, requested: Option<&str>) -> Result<Vec<i64>, Error> {
+    let header = req
+        .headers()
+        .get("x-source-ids")
+        .map(|v| v.to_str().map_err(|e| Error::Invalid(e.to_string())))
+        .transpose()?;
+    Ok(filter::sources(
+        requested
+            .map(filter::parse_sources)
+            .transpose()
+            .map_err(Error::Invalid)?,
+        header
+            .map(filter::parse_sources)
+            .transpose()
+            .map_err(Error::Invalid)?,
+    ))
+}
+
+/// Respect the most specific Accept range (including q=0 exclusions).
+fn geojson_type(req: &Request) -> Result<&'static str, poem::Error> {
+    let Some(accept) = req.headers().get(header::ACCEPT) else {
+        return Ok(GEOJSON);
+    };
+    let accept = accept.to_str().unwrap_or_default();
+    let mut matched = (-1, 0.0);
+    for range in accept.split(',') {
+        let mut parts = range.trim().split(';');
+        let media = parts.next().unwrap_or_default().trim();
+        let specificity = if media == GEOJSON {
+            2
+        } else if media == "application/*" {
+            1
+        } else if media == "*/*" {
+            0
+        } else {
+            continue;
+        };
+        let q = parts
+            .find_map(|p| p.trim().strip_prefix("q="))
+            .map_or(1.0, |q| q.parse::<f32>().unwrap_or(0.0));
+        if specificity > matched.0 {
+            matched = (specificity, q);
         }
     }
+    if matched.1 > 0.0 && matched.1 <= 1.0 {
+        Ok(GEOJSON)
+    } else {
+        Err(poem::Error::from_status(StatusCode::NOT_ACCEPTABLE))
+    }
+}
+
+const FEATURE_SQL: &str = "SELECT json_object('type', 'Feature', 'id', id, 'geometry', ST_AsGeoJSON(geom)::JSON, 'properties', properties::JSON) FROM features WHERE";
+
+fn add_links(mut feature: Value, collection: &str, sources: &[i64]) -> Value {
+    let sources = sources
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let id = percent_encoding::utf8_percent_encode(
+        feature["id"].as_str().unwrap(),
+        percent_encoding::NON_ALPHANUMERIC,
+    );
+    let href = format!("/collections/{collection}/items/{id}?sources={sources}");
+    feature["links"] = json!([
+        link(&href, "self", GEOJSON),
+        link(
+            &format!("/collections/{collection}"),
+            "collection",
+            "application/json"
+        )
+    ]);
+    feature
+}
+
+fn candidate_ids(conn: &duckdb::Connection, sql: &str) -> Result<Vec<String>, Error> {
+    Ok(conn
+        .prepare(sql)?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn features(
+    conn: &duckdb::Connection,
+    ids: &[String],
+    collection: &str,
+    sources: &[i64],
+) -> Result<Vec<Value>, Error> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        "{FEATURE_SQL} id IN ({}) ORDER BY id",
+        ids.iter()
+            .map(|id| filter::quote(id))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.map(|row| Ok(add_links(serde_json::from_str(&row?)?, collection, sources)))
+        .collect()
+}
+
+#[handler]
+async fn items(
+    Path(collection): Path<String>,
+    Query(mut query): Query<ItemsQuery>,
+    req: &Request,
+    Data(store): Data<&Arc<Store>>,
+) -> poem::Result<Response> {
+    store.collection(&collection)?;
+    let kind = geojson_type(req)?;
+    if !(1..=1000).contains(&query.limit) {
+        return Err(Error::Invalid("limit must be between 1 and 1000".into()).into());
+    }
+    let bounds = query
+        .bbox
+        .as_deref()
+        .map(filter::parse_bbox)
+        .transpose()
+        .map_err(Error::Invalid)?;
+    if let Some(raw) = &query.datetime {
+        filter::datetime(raw).map_err(Error::Invalid)?;
+    }
+    let sources = source_ids(req, query.sources.as_deref())?;
+    let candidate_sql = format!(
+        "SELECT id FROM features WHERE {} ORDER BY id LIMIT {} OFFSET {}",
+        filter::predicate(&collection, bounds, &sources),
+        query.limit + 1,
+        query.offset
+    );
+    let href = req.uri().to_string();
+    let key = format!("items:{href}:{sources:?}");
+    let bytes = store.bytes(key, move |conn| {
+        let mut ids = candidate_ids(conn, &candidate_sql)?;
+        let has_next = ids.len() > query.limit as usize;
+        ids.truncate(query.limit as usize);
+        let page = features(conn, &ids, &collection, &sources)?;
+        let mut links = vec![link(&href, "self", GEOJSON), link(&format!("/collections/{collection}"), "collection", "application/json")];
+        if has_next {
+            if let Some(offset) = query.offset.checked_add(query.limit) {
+                query.offset = offset;
+                let next = format!("/collections/{collection}/items?{}", serde_urlencoded::to_string(query).map_err(|e| Error::Backend(e.to_string()))?);
+                links.push(link(&next, "next", GEOJSON));
+            }
+        }
+        Ok(Bytes::from(serde_json::to_vec(&json!({"type": "FeatureCollection", "numberReturned": page.len(), "features": page, "links": links}))?))
+    }).await?;
+    Ok(response(bytes, kind))
+}
+
+#[handler]
+async fn item(
+    Path((collection, id)): Path<(String, String)>,
+    Query(query): Query<SourceQuery>,
+    req: &Request,
+    Data(store): Data<&Arc<Store>>,
+) -> poem::Result<Response> {
+    store.collection(&collection)?;
+    let kind = geojson_type(req)?;
+    let sources = source_ids(req, query.sources.as_deref())?;
+    let sql = format!(
+        "SELECT json_object('type', 'Feature', 'id', id, 'geometry', ST_AsGeoJSON(geom)::JSON, \
+         'properties', properties::JSON), layer, source_id FROM features WHERE id = {} LIMIT 1",
+        filter::quote(&id)
+    );
+    let key = format!("item:{collection}:{id}:{sources:?}");
+    let bytes = store
+        .bytes(key, move |conn| {
+            let (raw, actual_collection, source_id): (String, String, i64) =
+                match conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))) {
+                    Ok(row) => row,
+                    Err(duckdb::Error::QueryReturnedNoRows) => return Err(Error::NotFound(id)),
+                    Err(error) => return Err(error.into()),
+                };
+            if actual_collection != collection || !sources.contains(&source_id) {
+                return Err(Error::NotFound(id));
+            }
+            let feature = add_links(serde_json::from_str(&raw)?, &collection, &sources);
+            Ok(Bytes::from(serde_json::to_vec(&feature)?))
+        })
+        .await?;
+    Ok(response(bytes, kind))
 }

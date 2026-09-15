@@ -1,75 +1,84 @@
 #!/usr/bin/env python3
-"""Hammer the Poem OGC HTTP endpoint, report rps + p50/p99.
+"""Closed-loop HTTP benchmark: persistent connections, successful rps, status counts.
 
-Stdlib only. Start the server first, e.g.:
-    cargo run --features serve -- --shard-dir ./fixtures
-    BASE=http://127.0.0.1:3000 CONC=64 REQ=100 just bench-ogc
-
-Target: 2k+ rps on tiles/items (hot cache path). Use --jitter to force
-cold DuckDB work per request.
+Start `just run` first. Use --jitter for distinct requests, --route tiles for MVT.
+The default bbox matches `just fixture-osm` (Berlin).
 """
-
 import argparse
-import concurrent.futures
-import statistics
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+import http.client
+import json
+import math
 import time
-import urllib.request
-
-TILES = [(14, 4222, 7544), (14, 4223, 7544), (14, 4222, 7545), (14, 4223, 7545)]
-
-
-def get(url: str, timeout: float) -> tuple[int, float]:
-    start = time.perf_counter()
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            response.read()
-            return response.status, time.perf_counter() - start
-    except Exception:
-        return 0, time.perf_counter() - start
+from urllib.parse import urlsplit
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="http://127.0.0.1:3000")
-    parser.add_argument("--route", choices=["tiles", "items"], default="tiles")
-    parser.add_argument("--concurrency", type=int, default=64)
+    parser.add_argument("--route", choices=["tiles", "items"], default="items")
+    parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--requests", type=int, default=100)
-    parser.add_argument("--sources", default="1,2,3")
+    parser.add_argument("--sources", default="1")
+    parser.add_argument("--bbox", default="13.35,52.48,13.45,52.55")
+    parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--jitter", action="store_true")
     args = parser.parse_args()
+    if min(args.concurrency, args.requests, args.limit) < 1:
+        parser.error("concurrency, requests and limit must be positive")
+    west, south, east, north = map(float, args.bbox.split(","))
+    base = urlsplit(args.base)
+    connection = http.client.HTTPSConnection if base.scheme == "https" else http.client.HTTPConnection
+    z = 14
+    x = int(((west + east) / 2 + 180) / 360 * 2**z)
+    lat = math.radians((south + north) / 2)
+    y = int((1 - math.asinh(math.tan(lat)) / math.pi) / 2 * 2**z)
 
-    def url_for(i: int) -> str:
-        if args.route == "tiles":
-            z, x, y = TILES[i % len(TILES)]
-            if args.jitter:
-                x += (i // len(TILES)) % 8
-            return f"{args.base}/collections/buildings/tiles/{z}/{x}/{y}"
-        dx = (i * 0.0001) if args.jitter else 0.0
-        return (
-            f"{args.base}/collections/buildings/items"
-            f"?bbox={-87.35 + dx},13.95,{-87.05 + dx},14.2&limit=10&sources={args.sources}"
-        )
+    def worker(task: int):
+        conn = connection(base.hostname, base.port, timeout=30)
+        statuses, latencies, nonempty, transferred = Counter(), [], 0, 0
+        for i in range(args.requests):
+            index = task * args.requests + i
+            if args.route == "tiles":
+                tx = (x + index) % 2**z if args.jitter else x
+                path = f"/collections/buildings/tiles/{z}/{tx}/{y}?sources={args.sources}"
+            else:
+                dx = index * 1e-8 if args.jitter else 0
+                path = (f"/collections/buildings/items?bbox={west + dx},{south},{east + dx},{north}"
+                        f"&limit={args.limit}&sources={args.sources}")
+            start = time.perf_counter()
+            try:
+                conn.request("GET", base.path.rstrip("/") + path)
+                response = conn.getresponse()
+                payload = response.read()
+                status = response.status
+                if status in (200, 204):
+                    latencies.append(time.perf_counter() - start)
+                    transferred += len(payload)
+                    nonempty += int(bool(payload) if args.route == "tiles" else json.loads(payload)["numberReturned"] > 0)
+            except (OSError, http.client.HTTPException):
+                status = 0
+                conn.close()
+                conn = connection(base.hostname, base.port, timeout=30)
+            statuses[status] += 1
+        conn.close()
+        return statuses, latencies, nonempty, transferred
 
-    total = args.concurrency * args.requests
-    latencies: list[float] = []
-    statuses: dict[int, int] = {}
     start = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futures = [
-            pool.submit(get, url_for(i), 30.0) for i in range(total)
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            status, latency = future.result()
-            statuses[status] = statuses.get(status, 0) + 1
-            latencies.append(latency)
-    secs = time.perf_counter() - start
+    statuses, latencies, nonempty, transferred = Counter(), [], 0, 0
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        for counts, times, full, size in pool.map(worker, range(args.concurrency)):
+            statuses.update(counts)
+            latencies.extend(times)
+            nonempty += full
+            transferred += size
+    elapsed = time.perf_counter() - start
     latencies.sort()
-    p50 = latencies[int(len(latencies) * 0.50)]
-    p99 = latencies[int(len(latencies) * 0.99)]
-    print(
-        f"requests={total} secs={secs:.2f} rps={total / secs:.0f} "
-        f"p50={p50 * 1000:.1f}ms p99={p99 * 1000:.1f}ms statuses={statuses}"
-    )
+    percentile = lambda p: latencies[min(int(len(latencies) * p), len(latencies) - 1)] * 1000 if latencies else 0
+    print(f"requests={sum(statuses.values())} secs={elapsed:.2f} success_rps={len(latencies) / elapsed:.0f} "
+          f"p50={percentile(.5):.1f}ms p99={percentile(.99):.1f}ms "
+          f"nonempty={nonempty} MB/s={transferred / elapsed / 1e6:.1f} statuses={dict(statuses)}")
 
 
 if __name__ == "__main__":

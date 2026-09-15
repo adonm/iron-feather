@@ -1,125 +1,128 @@
-//! Request parsing shared by Features, tiles, and (later) Flight.
-//!
-//! Pure functions: `just test` covers them with no backend.
-//!
-//! Lineage rule (enforced everywhere): `source_ids` come from auth
-//! (JWT/OIDC policy in prod, `?sources=` dev stand-in). They NEVER come from
-//! the user `filter` expression. An empty set matches nothing.
+//! Shared request validation and SQL literals. No caller-supplied SQL.
 
-/// Parse `bbox=minx,miny,maxx,maxy` into WGS84 bounds.
-pub fn parse_bbox(raw: &str) -> Result<[f64; 4], String> {
-    let parts: Vec<&str> = raw.split(',').collect();
-    if parts.len() != 4 {
-        return Err(format!("bbox must have 4 numbers, got {}", parts.len()));
-    }
-    let mut out = [0.0f64; 4];
-    for (i, part) in parts.iter().enumerate() {
-        out[i] = part
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| format!("bbox[{i}] is not a number: {part}"))?;
-    }
-    if !(out[0] < out[2] && out[1] < out[3]) {
-        return Err("bbox requires minx<maxx and miny<maxy".to_string());
-    }
-    Ok(out)
+pub fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Parse a comma-separated source-id allowlist into a sorted, deduped set.
-pub fn parse_source_list(raw: Option<&str>) -> Vec<i64> {
-    let mut ids: Vec<i64> = raw
-        .unwrap_or_default()
+pub fn collection_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+}
+
+/// CRS84 bbox: 2D or 3D (height is irrelevant to our 2D features).
+/// West > east crosses the antimeridian; zero-width boxes are valid.
+pub fn bbox(values: &[f64]) -> Result<[f64; 4], String> {
+    let b = match values {
+        [w, s, e, n] => [*w, *s, *e, *n],
+        [w, s, low, e, n, high] if low <= high => [*w, *s, *e, *n],
+        _ => return Err("bbox requires 4 or 6 ordered numbers".into()),
+    };
+    if !values.iter().all(|v| v.is_finite())
+        || !(-180.0..=180.0).contains(&b[0])
+        || !(-180.0..=180.0).contains(&b[2])
+        || !(-90.0..=90.0).contains(&b[1])
+        || !(-90.0..=90.0).contains(&b[3])
+        || b[1] > b[3]
+    {
+        return Err("bbox must be finite CRS84 bounds with south <= north".into());
+    }
+    Ok(b)
+}
+
+pub fn parse_bbox(raw: &str) -> Result<[f64; 4], String> {
+    let values = raw
         .split(',')
-        .filter_map(|part| part.trim().parse().ok())
-        .collect();
+        .map(|v| v.trim().parse::<f64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "bbox must contain numbers")?;
+    bbox(&values)
+}
+
+pub fn spatial_predicate(b: [f64; 4]) -> String {
+    let envelope = |w, e| {
+        format!(
+            "ST_Intersects(geom, ST_MakeEnvelope({w}, {}, {e}, {}))",
+            b[1], b[3]
+        )
+    };
+    if b[0] > b[2] {
+        format!("({} OR {})", envelope(b[0], 180.0), envelope(-180.0, b[2]))
+    } else {
+        envelope(b[0], b[2])
+    }
+}
+
+pub fn parse_sources(raw: &str) -> Result<Vec<i64>, String> {
+    if raw.is_empty() {
+        return Ok(vec![]);
+    }
+    raw.split(',')
+        .map(|v| {
+            v.trim()
+                .parse()
+                .map_err(|_| "sources must be integers".into())
+        })
+        .collect()
+}
+
+/// A request may narrow the header's source set, never broaden it.
+/// These are data filters, not an authentication mechanism.
+pub fn sources(requested: Option<Vec<i64>>, header: Option<Vec<i64>>) -> Vec<i64> {
+    let mut ids = match (requested, header) {
+        (Some(ids), Some(allowed)) => ids.into_iter().filter(|id| allowed.contains(id)).collect(),
+        (Some(ids), None) | (None, Some(ids)) => ids,
+        (None, None) => vec![],
+    };
     ids.sort_unstable();
     ids.dedup();
     ids
 }
 
-/// SQL fragment enforcing lineage. Empty set matches nothing (secure default).
-pub fn lineage_predicate(source_ids: &[i64]) -> String {
-    if source_ids.is_empty() {
-        return "1 = 0".to_string();
-    }
-    let list = source_ids
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("source_id IN ({list})")
-}
-
-/// Cache-key segment binding data version + policy. Full responses are only
-/// ever shared between callers with identical effective visibility.
-pub fn visibility_fingerprint(
-    serving_version: &str,
-    policy_version: &str,
-    source_ids: &[i64],
-) -> String {
-    let mut ids = source_ids.to_vec();
-    ids.sort_unstable();
-    ids.dedup();
-    format!("{serving_version}:{policy_version}:{ids:?}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bbox_ok() {
-        assert_eq!(
-            parse_bbox("-180,-90,180,90"),
-            Ok([-180.0, -90.0, 180.0, 90.0])
-        );
-    }
-
-    #[test]
-    fn bbox_rejects_shape_and_order() {
-        assert!(parse_bbox("1,2,3").is_err());
-        assert!(parse_bbox("3,2,1,0").is_err());
-        assert!(parse_bbox("a,b,c,d").is_err());
-    }
-
-    #[test]
-    fn lineage_empty_matches_nothing() {
-        assert_eq!(lineage_predicate(&[]), "1 = 0");
-        assert_eq!(lineage_predicate(&[7, 3]), "source_id IN (7,3)");
-    }
-
-    #[test]
-    fn sources_sorted_and_deduped() {
-        assert_eq!(parse_source_list(Some("3,1,3,x")), vec![1, 3]);
-        assert!(parse_source_list(None).is_empty());
-    }
-
-    #[test]
-    fn fingerprint_stable_regardless_of_order() {
-        let a = visibility_fingerprint("v3", "p9", &[3, 1]);
-        let b = visibility_fingerprint("v3", "p9", &[1, 3, 1]);
-        assert_eq!(a, b);
-        assert_ne!(a, visibility_fingerprint("v3", "p10", &[1, 3]));
-    }
-}
-
-/// Validate an already-decoded bbox (JSON tickets carry numbers, not strings).
-pub fn check_bbox(bbox: [f64; 4]) -> Result<[f64; 4], String> {
-    if bbox.iter().all(|v| v.is_finite()) && bbox[0] < bbox[2] && bbox[1] < bbox[3] {
-        Ok(bbox)
+pub fn predicate(collection: &str, bounds: Option<[f64; 4]>, sources: &[i64]) -> String {
+    let lineage = if sources.is_empty() {
+        "FALSE".into()
     } else {
-        Err("bbox requires finite minx<maxx and miny<maxy".to_string())
+        format!(
+            "source_id IN ({})",
+            sources
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let mut sql = format!("layer = {} AND {lineage}", quote(collection));
+    if let Some(b) = bounds {
+        sql.push_str(&format!(" AND {}", spatial_predicate(b)));
     }
+    sql
 }
 
-#[cfg(test)]
-mod bbox_tests {
-    use super::check_bbox;
-
-    #[test]
-    fn check_bbox_ok_and_rejects() {
-        assert!(check_bbox([-180.0, -90.0, 180.0, 90.0]).is_ok());
-        assert!(check_bbox([0.0, 0.0, 0.0, 1.0]).is_err());
-        assert!(check_bbox([f64::NAN, 0.0, 1.0, 1.0]).is_err());
+/// Layercake's edit timestamp isn't a feature's temporal extent. Features
+/// without temporal geometry match every valid OGC datetime filter.
+pub fn datetime(raw: &str) -> Result<(), String> {
+    let parse = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s).map_err(|_| "invalid RFC3339 datetime".to_string())
+    };
+    if let Some((start, end)) = raw.split_once('/') {
+        let start = if start == ".." || start.is_empty() {
+            None
+        } else {
+            Some(parse(start)?)
+        };
+        let end = if end == ".." || end.is_empty() {
+            None
+        } else {
+            Some(parse(end)?)
+        };
+        if start.is_none() && end.is_none() || matches!((start, end), (Some(a), Some(b)) if a > b) {
+            return Err("datetime requires a nonempty, ordered interval".into());
+        }
+    } else {
+        parse(raw)?;
     }
+    Ok(())
 }

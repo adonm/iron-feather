@@ -1,61 +1,71 @@
-//! Plain-Poem routes: health and vector tiles.
-//!
-//! Tiles stay outside the OpenAPI impl so the MVT content type is exact
-//! (`application/vnd.mapbox-vector-tile`). Envelope math comes from Martin
-//! (`martin-tile-utils`) as a library.
-
+//! XYZ MVT extension. Spatial filtering is CRS84; tile encoding is Web Mercator.
+use crate::{
+    api::{self, SourceQuery},
+    filter,
+    store::{Error, Store},
+};
+use bytes::Bytes;
 use poem::{
     handler,
-    http::{header, StatusCode},
-    web::{Data, Path},
+    http::StatusCode,
+    web::{Data, Path, Query},
     Request, Response,
 };
-
-use crate::{filter::parse_source_list, AppState};
-
-#[handler]
-pub fn healthz() -> &'static str {
-    "ok"
-}
+use std::sync::Arc;
 
 #[handler]
 pub async fn tile(
     Path((collection, z, x, y)): Path<(String, u8, u32, u32)>,
+    Query(query): Query<SourceQuery>,
     req: &Request,
-    Data(state): Data<&AppState>,
-) -> Response {
-    // Mirrors martin_tile_utils::MAX_ZOOM (30); xyz_to_bbox panics above it.
-    if z > 30 {
-        return status_only(StatusCode::BAD_REQUEST);
+    Data(store): Data<&Arc<Store>>,
+) -> Result<Response, Error> {
+    store.collection(&collection)?;
+    if z > 30 || x >= (1u32 << z) || y >= (1u32 << z) {
+        return Err(Error::Invalid("tile coordinates outside XYZ matrix".into()));
     }
-    // WGS84 [min_lng, min_lat, max_lng, max_lat], via Martin as a lib.
+    let sources = api::source_ids(req, query.sources.as_deref())?;
     let bbox = martin_tile_utils::xyz_to_bbox(z, x, y, x, y);
-    let header_sources = req
-        .headers()
-        .get("x-source-ids")
-        .and_then(|value| value.to_str().ok());
-    let sources = parse_source_list(header_sources);
-
-    match state.store.tile(&collection, bbox, z, &sources).await {
-        Ok(Some(bytes)) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/vnd.mapbox-vector-tile")
-            .body(bytes),
-        Ok(None) => status_only(StatusCode::NO_CONTENT),
-        Err(error) => {
-            tracing::warn!(error = ?error, collection = %collection, zoom = z, "tile request failed");
-            match error {
-                crate::store::StoreError::NotFound(_) => status_only(StatusCode::NOT_FOUND),
-                crate::store::StoreError::Overloaded => Response::builder()
-                    .status(StatusCode::TOO_MANY_REQUESTS)
-                    .header(header::RETRY_AFTER, "1")
-                    .body(()),
-                crate::store::StoreError::Backend(_) => status_only(StatusCode::BAD_GATEWAY),
+    let half = std::f64::consts::PI * 6_378_137.0;
+    let span = 2.0 * half / f64::from(1u32 << z);
+    let west = -half + f64::from(x) * span;
+    let north = half - f64::from(y) * span;
+    let candidate_sql = format!(
+        "SELECT id FROM features WHERE {} ORDER BY id LIMIT 5000",
+        filter::predicate(&collection, Some(bbox), &sources)
+    );
+    let key = format!("tile:{z}:{x}:{y}:{collection}:{sources:?}");
+    let bytes = store
+        .bytes(key, move |conn| {
+            let ids = conn
+                .prepare(&candidate_sql)?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if ids.is_empty() {
+                return Ok(Bytes::new());
             }
-        }
+            let ids = ids
+                .iter()
+                .map(|id| filter::quote(id))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT ST_AsMVT(t, {}) FROM (SELECT id, ST_AsMVTGeom(\
+                 ST_Transform(geom, 'EPSG:4326', 'EPSG:3857', always_xy := true), \
+                 ST_Extent(ST_MakeEnvelope({west}, {}, {}, {north})), 4096, 64, true) AS geom \
+                 FROM features WHERE id IN ({ids}) ORDER BY id) t \
+                 WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)",
+                filter::quote(&collection),
+                north - span,
+                west + span
+            );
+            let tile: Option<Vec<u8>> = conn.query_row(&sql, [], |r| r.get(0))?;
+            Ok(Bytes::from(tile.unwrap_or_default()))
+        })
+        .await?;
+    if bytes.is_empty() {
+        Ok(Response::builder().status(StatusCode::NO_CONTENT).finish())
+    } else {
+        Ok(api::response(bytes, "application/vnd.mapbox-vector-tile"))
     }
-}
-
-fn status_only(status: StatusCode) -> Response {
-    Response::builder().status(status).body(())
 }

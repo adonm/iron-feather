@@ -1,222 +1,218 @@
-//! Storage backends behind one enum.
-//!
-//! `Store` is an enum (not `dyn`) because async fns are not object-safe.
-//! `StubStore` serves synthetic demo data with no backend; the live
-//! DuckDB+Turso implementation lives in [`crate::serve`] (`--features serve`).
+//! One immutable shard, one fail-fast pool, byte-bounded in-process caches.
+//! Moka owns both caching and cancellation-safe request coalescing.
 
-use super::api::{CollectionMeta, Feature, FeatureCollection, Geometry, Link};
-use thiserror::Error;
+use bytes::Bytes;
+use duckdb::{
+    arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
+    AccessMode, Config, Connection,
+};
+use moka::future::Cache;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
-#[derive(Debug, Error)]
-pub enum StoreError {
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
-    #[error("overloaded: shedding load")]
+    #[error("{0}")]
+    Invalid(String),
+    #[error("server busy; retry")]
     Overloaded,
-    #[error("backend error: {0}")]
+    #[error("{0}")]
     Backend(String),
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ItemQuery {
-    pub bbox: Option<[f64; 4]>,
-    pub limit: u32,
-    pub offset: u32,
-    pub datetime: Option<String>,
-    pub filter: Option<String>,
-    pub properties: Option<String>,
-    /// Allowlisted source ids, from auth. Never from `filter`.
-    pub source_ids: Vec<i64>,
+impl From<duckdb::Error> for Error {
+    fn from(e: duckdb::Error) -> Self {
+        Self::Backend(e.to_string())
+    }
+}
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Backend(e.to_string())
+    }
 }
 
-pub enum Store {
-    Stub(StubStore),
-    #[cfg(feature = "serve")]
-    Serve(super::serve::ServeStore),
+pub struct ArrowResult {
+    pub schema: SchemaRef,
+    pub batches: Vec<RecordBatch>,
+}
+
+pub struct Store {
+    pub collections: Vec<String>,
+    pool: Arc<Mutex<Vec<Connection>>>,
+    http: Cache<String, Bytes>,
+    arrow: Cache<String, Arc<ArrowResult>>,
+}
+
+// The worker owns the checkout: disconnecting a client cannot return a
+// connection while its blocking DuckDB query is still running.
+struct Checkout {
+    conn: Option<Connection>,
+    pool: Arc<Mutex<Vec<Connection>>>,
+}
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        self.pool.lock().unwrap().push(self.conn.take().unwrap());
+    }
 }
 
 impl Store {
-    pub async fn collections(&self) -> Result<Vec<CollectionMeta>, StoreError> {
-        match self {
-            Store::Stub(store) => Ok(store.collections()),
-            #[cfg(feature = "serve")]
-            Store::Serve(store) => store.collections().await,
+    pub fn open(location: &str, connections: usize, cache_bytes: u64) -> Result<Self, Error> {
+        if connections == 0 {
+            return Err(Error::Invalid("connections must be positive".into()));
         }
-    }
-
-    pub async fn collection(&self, id: &str) -> Result<CollectionMeta, StoreError> {
-        match self {
-            Store::Stub(store) => store.collection(id),
-            #[cfg(feature = "serve")]
-            Store::Serve(store) => store.collection(id).await,
-        }
-    }
-
-    pub async fn items(
-        &self,
-        collection: &str,
-        query: &ItemQuery,
-    ) -> Result<FeatureCollection, StoreError> {
-        match self {
-            Store::Stub(store) => store.items(collection, query),
-            #[cfg(feature = "serve")]
-            Store::Serve(store) => store.items(collection, query).await,
-        }
-    }
-
-    pub async fn item(
-        &self,
-        collection: &str,
-        id: &str,
-        source_ids: &[i64],
-    ) -> Result<Feature, StoreError> {
-        match self {
-            Store::Stub(store) => store.item(collection, id, source_ids),
-            #[cfg(feature = "serve")]
-            Store::Serve(store) => store.item(collection, id, source_ids).await,
-        }
-    }
-
-    pub async fn tile(
-        &self,
-        collection: &str,
-        bbox: [f64; 4],
-        zoom: u8,
-        source_ids: &[i64],
-    ) -> Result<Option<Vec<u8>>, StoreError> {
-        match self {
-            Store::Stub(store) => store.tile(collection, bbox, zoom, source_ids),
-            #[cfg(feature = "serve")]
-            Store::Serve(store) => store.tile(collection, bbox, zoom, source_ids).await,
-        }
-    }
-}
-
-/// Collections served by every backend in v0.
-pub(crate) fn builtin_collections() -> Vec<CollectionMeta> {
-    vec![
-        CollectionMeta {
-            id: "buildings".to_string(),
-            title: "Buildings".to_string(),
-            description: Some("Buildings and building parts.".to_string()),
-            item_type: "feature".to_string(),
-            links: vec![],
-        },
-        CollectionMeta {
-            id: "ag_fields".to_string(),
-            title: "Agricultural fields".to_string(),
-            description: Some("Fields and subfields.".to_string()),
-            item_type: "feature".to_string(),
-            links: vec![],
-        },
-    ]
-}
-
-/// In-memory demo backend. Synthetic points only, so lineage has nothing to
-/// leak; the live backend enforces it in SQL.
-#[derive(Debug, Clone, Copy)]
-pub struct StubStore;
-
-impl StubStore {
-    fn collections(&self) -> Vec<CollectionMeta> {
-        builtin_collections()
-    }
-
-    fn collection(&self, id: &str) -> Result<CollectionMeta, StoreError> {
-        self.collections()
-            .into_iter()
-            .find(|c| c.id == id)
-            .ok_or_else(|| StoreError::NotFound(id.to_string()))
-    }
-
-    fn demo_features(collection: &str) -> Option<Vec<Feature>> {
-        let point = |id: &str, lon: f64, lat: f64, props: &[(&str, &str)]| Feature {
-            kind: "Feature".to_string(),
-            id: id.to_string(),
-            geometry: Some(Geometry {
-                kind: "Point".to_string(),
-                coordinates: vec![lon, lat],
-            }),
-            properties: props
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+        let remote = ["http://", "https://", "s3://"]
+            .iter()
+            .any(|scheme| location.starts_with(scheme));
+        let config = Config::default().threads(1)?;
+        let conn = if remote {
+            Connection::open_in_memory_with_flags(config)?
+        } else {
+            Connection::open_with_flags(
+                Path::new(location),
+                config.access_mode(AccessMode::ReadOnly)?,
+            )?
         };
-        match collection {
-            "buildings" => Some(vec![
-                point(
-                    "b1",
-                    13.40,
-                    52.52,
-                    &[("use", "residential"), ("height_m", "21")],
-                ),
-                point(
-                    "b2",
-                    13.41,
-                    52.53,
-                    &[("use", "commercial"), ("height_m", "34")],
-                ),
-            ]),
-            "ag_fields" => Some(vec![
-                point("f1", 11.10, 49.40, &[("crop", "wheat")]),
-                point("f2", 11.12, 49.41, &[("crop", "barley")]),
-            ]),
-            _ => None,
+        conn.execute_batch(
+            "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; LOAD spatial;",
+        )?;
+        if remote {
+            conn.execute_batch(&format!(
+                "LOAD httpfs; ATTACH {} AS shard (READ_ONLY); USE shard;",
+                crate::filter::quote(location)
+            ))?;
         }
-    }
-
-    fn items(&self, collection: &str, query: &ItemQuery) -> Result<FeatureCollection, StoreError> {
-        let mut features = Self::demo_features(collection)
-            .ok_or_else(|| StoreError::NotFound(collection.to_string()))?;
-        // Stub honors bbox coarsely (point-in-box) so pagination demos behave.
-        if let Some(b) = query.bbox {
-            features.retain(|f| {
-                f.geometry.as_ref().is_some_and(|g| {
-                    g.coordinates.len() == 2
-                        && g.coordinates[0] >= b[0]
-                        && g.coordinates[0] <= b[2]
-                        && g.coordinates[1] >= b[1]
-                        && g.coordinates[1] <= b[3]
+        conn.execute_batch("SET enable_external_access=false;")?;
+        let _ = conn.prepare(
+            "SELECT id, layer, source_id, ST_AsWKB(geom), properties::JSON FROM features LIMIT 0",
+        )?
+        .query([])?;
+        let collections = conn
+            .prepare("SELECT id FROM collections ORDER BY id")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if collections
+            .iter()
+            .any(|id| !crate::filter::collection_id(id))
+        {
+            return Err(Error::Invalid(
+                "shard contains an invalid collection id".into(),
+            ));
+        }
+        let mut pool = Vec::with_capacity(connections);
+        for _ in 1..connections {
+            let clone = conn.try_clone()?;
+            if remote {
+                clone.execute_batch("USE shard;")?;
+            }
+            clone.execute_batch("SET enable_external_access=false;")?;
+            pool.push(clone);
+        }
+        pool.push(conn);
+        Ok(Self {
+            collections,
+            pool: Arc::new(Mutex::new(pool)),
+            http: Cache::builder()
+                .max_capacity(cache_bytes / 2)
+                .weigher(|key: &String, value: &Bytes| {
+                    (key.len() + value.len()).min(u32::MAX as usize) as u32
                 })
-            });
-        }
-        let start = (query.offset as usize).min(features.len());
-        let end = start
-            .saturating_add(query.limit as usize)
-            .min(features.len());
-        let page = features[start..end].to_vec();
-        let number_returned = page.len() as i64;
-        Ok(FeatureCollection {
-            kind: "FeatureCollection".to_string(),
-            features: page,
-            links: vec![Link {
-                href: String::new(),
-                rel: String::new(),
-                media_type: None,
-                title: None,
-            }],
-            number_returned,
+                .build(),
+            arrow: Cache::builder()
+                .max_capacity(cache_bytes / 2)
+                .weigher(|key: &String, value: &Arc<ArrowResult>| {
+                    (key.len()
+                        + value
+                            .batches
+                            .iter()
+                            .map(RecordBatch::get_array_memory_size)
+                            .sum::<usize>()
+                        + 1024)
+                        .min(u32::MAX as usize) as u32
+                })
+                .build(),
         })
     }
 
-    fn item(&self, collection: &str, id: &str, _source_ids: &[i64]) -> Result<Feature, StoreError> {
-        Self::demo_features(collection)
-            .ok_or_else(|| StoreError::NotFound(collection.to_string()))?
-            .into_iter()
-            .find(|f| f.id == id)
-            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    pub fn collection(&self, id: &str) -> Result<(), Error> {
+        if self.collections.iter().any(|c| c == id) {
+            Ok(())
+        } else {
+            Err(Error::NotFound(id.into()))
+        }
     }
 
-    fn tile(
+    pub async fn run<T, F>(&self, query: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, Error> + Send + 'static,
+    {
+        let conn = self.pool.lock().unwrap().pop().ok_or(Error::Overloaded)?;
+        let checkout = Checkout {
+            conn: Some(conn),
+            pool: self.pool.clone(),
+        };
+        tokio::task::spawn_blocking(move || query(checkout.conn.as_ref().unwrap()))
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?
+    }
+
+    /// Key must include every input used to produce the encoded HTTP body.
+    pub async fn bytes<F>(&self, key: String, query: F) -> Result<Bytes, Error>
+    where
+        F: FnOnce(&Connection) -> Result<Bytes, Error> + Send + 'static,
+    {
+        self.http
+            .try_get_with(key, self.run(query))
+            .await
+            .map_err(|e| (*e).clone())
+    }
+
+    /// Fetch candidate IDs using narrow columns, then payloads through the
+    /// single-column ART index. This avoids a wide base-table scan, which is
+    /// especially important for remotely attached database files.
+    pub async fn arrow(
         &self,
-        collection: &str,
-        _bbox: [f64; 4],
-        _zoom: u8,
-        _source_ids: &[i64],
-    ) -> Result<Option<Vec<u8>>, StoreError> {
-        Self::demo_features(collection)
-            .ok_or_else(|| StoreError::NotFound(collection.to_string()))?;
-        // No tile bytes in stub mode: 204. Live tiles come from DuckDB ST_AsMVT.
-        Ok(None)
+        candidate_sql: Option<String>,
+        projection: String,
+    ) -> Result<Arc<ArrowResult>, Error> {
+        let key = format!("arrow:{projection}:{candidate_sql:?}");
+        self.arrow
+            .try_get_with(
+                key,
+                self.run(move |conn| {
+                    let ids = match candidate_sql {
+                        Some(sql) => conn
+                            .prepare(&sql)?
+                            .query_map([], |row| row.get::<_, String>(0))?
+                            .collect::<Result<Vec<_>, _>>()?,
+                        None => vec![],
+                    };
+                    let predicate = if ids.is_empty() {
+                        "FALSE".to_string()
+                    } else {
+                        format!(
+                            "id IN ({})",
+                            ids.iter()
+                                .map(|id| crate::filter::quote(id))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    };
+                    let sql =
+                        format!("SELECT {projection} FROM features WHERE {predicate} ORDER BY id");
+                    let mut stmt = conn.prepare(&sql)?;
+                    let result = stmt.query_arrow([])?;
+                    Ok(Arc::new(ArrowResult {
+                        schema: result.get_schema(),
+                        batches: result.collect(),
+                    }))
+                }),
+            )
+            .await
+            .map_err(|e| (*e).clone())
     }
 }
