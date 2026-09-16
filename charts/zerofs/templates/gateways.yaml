@@ -1,0 +1,145 @@
+# One ZeroFS gateway per zone over the same bucket: the writerZone gateway
+# bootstraps as leader (the single writer), the rest as standbys (HA +
+# warm cache, take over 9P on failover). Verified against stock ZeroFS:
+# independent leaders over one bucket fence each other, and standbys do
+# not serve 9P — so cross-AZ reads go to the leader until a read-serving
+# replica exists upstream. Per-zone StorageClasses already point at
+# per-zone gateway Services, making that switch values-only.
+{{- range $zone := .Values.zones }}
+{{- $gw := include "zerofs.gwName" (list $ $zone) }}
+{{- $isWriter := eq $zone $.Values.writerZone }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $gw }}-config
+stringData:
+  ZEROFS_PASSWORD: {{ $.Values.password | quote }}
+  zerofs.toml: |
+    [cache]
+    dir = "/data/cache"
+    disk_size_gb = {{ $.Values.cache.diskSizeGb }}
+    memory_size_gb = {{ $.Values.cache.memorySizeGb }}
+    [storage]
+    url = "{{ $.Values.backend.url }}"
+    encryption_password = "${ZEROFS_PASSWORD}"
+    [servers]
+    [servers.ninep]
+    addresses = ["0.0.0.0:5564"]
+    [servers.rpc]
+    addresses = ["0.0.0.0:7000"]
+    [replication]
+    node_id = "{{ $zone }}"
+    role = "{{ if $isWriter }}leader{{ else }}standby{{ end }}"
+    replication_listen = "0.0.0.0:9000"
+    peers = [{{ range $peer := $.Values.zones }}{{ if ne $peer $zone }}"{{ include "zerofs.gwName" (list $ $peer) }}:9000",{{ end }}{{ end }}]
+    [aws]
+    access_key_id = "${AWS_ACCESS_KEY_ID}"
+    secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+    endpoint = "http://{{ include "zerofs.fullname" $ }}-garage:3900"
+    default_region = "{{ $.Values.backend.region }}"
+    allow_http = "true"
+    conditional_put = "redis://{{ include "zerofs.fullname" $ }}-redis:6379"
+    [telemetry]
+    enabled = false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $gw }}
+spec:
+  selector:
+    app: {{ $gw }}
+  ports:
+    - name: ninep
+      port: 5564
+    - name: admin
+      port: 7000
+    - name: repl
+      port: 9000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $gw }}
+spec:
+  serviceName: {{ $gw }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ $gw }}
+  template:
+    metadata:
+      labels:
+        app: {{ $gw }}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/zone
+                    operator: In
+                    values: ["{{ $zone }}"]
+      # The image runs as UID 1001 but hostPath dirs arrive root-owned.
+      initContainers:
+        - name: fix-cache-perms
+          image: busybox:stable-musl
+          command: ["sh", "-c", "mkdir -p /data/cache && chown -R 1001:1001 /data/cache"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: cache
+              mountPath: /data/cache
+      containers:
+        - name: zerofs
+          image: {{ $.Values.images.zerofs }}
+          args: ["run", "-c", "/etc/zerofs/zerofs.toml"]
+          ports:
+            - name: ninep
+              containerPort: 5564
+            - name: admin
+              containerPort: 7000
+            - name: repl
+              containerPort: 9000
+          # Both roles bind the replication port early; 9P/admin appear
+          # only on the serving leader.
+          readinessProbe:
+            tcpSocket:
+              port: repl
+            periodSeconds: 2
+            timeoutSeconds: 1
+          env:
+            - name: ZEROFS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $gw }}-config
+                  key: ZEROFS_PASSWORD
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.backend.existingSecret }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.backend.existingSecret }}
+                  key: AWS_SECRET_ACCESS_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zerofs
+            - name: cache
+              mountPath: /data/cache
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ $gw }}-config
+            items:
+              - key: zerofs.toml
+                path: zerofs.toml
+        - name: cache
+          hostPath:
+            # Node-local storage: NVMe in prod, the kind /nvme extraMount here.
+            path: {{ $.Values.cache.dir }}
+            type: DirectoryOrCreate
+{{- end }}

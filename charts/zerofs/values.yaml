@@ -1,0 +1,39 @@
+# AZ-local ZeroFS cache layer. One serving gateway (writer/leader) plus one
+# standby per extra zone; per-zone StorageClasses pre-wire the routing seam
+# so a future read-serving gateway per AZ is a values-only switch.
+zones:
+  - az-a
+  - az-b
+writerZone: az-a
+
+images:
+  zerofs: ghcr.io/barre/zerofs:2.3.3
+  csi: ghcr.io/barre/zerofs-csi:latest
+  provisioner: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+  registrar: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
+  # NOTE: upstream's livenessprobe sidecar + httpGet probe is omitted: in
+  # this environment the sidecar never serves :9808, so kubelet SIGTERMs the
+  # healthy plugin into a CrashLoop. Revisit with upstream if it reproduces
+  # outside kind.
+
+# S3 backend. Local rig uses the in-chart Garage; prod points url at real S3
+# (via backend.existingSecret) and disables the bundled backend.
+backend:
+  enabled: true
+  url: s3://lake/zerofs
+  region: us-east-1
+  existingSecret: lake-s3 # keys: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+
+# Filesystem encryption password (dev default; override in prod).
+password: local-rig-password-not-a-secret
+
+# Gateway cache budgets. cacheDir must be node-local storage (NVMe in prod;
+# the kind /nvme extraMount in the rig) so reads stay AZ-local after fill.
+cache:
+  dir: /nvme/zerofs-cache
+  diskSizeGb: 5.0
+  memorySizeGb: 0.5
+
+# Per-zone 9P/admin service names are derived as
+# <fullname>-gw-<zone>; StorageClasses reference them (see storageclass.yaml).
+volumesRoot: /volumes

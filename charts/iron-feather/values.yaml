@@ -1,0 +1,48 @@
+# Read pool over the ZeroFS lake. Installs into the same namespace as the
+# zerofs dependency so short gateway DNS names resolve for the node plugin.
+image:
+  repository: iron-feather
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Pinned snapshot ref resolved once per pod at startup (latest, main, or a
+# tag). Restart pods (rollout) to move readers to a newer snapshot.
+ref: latest
+
+# Spread readers across zones; each mounts the lake read-only.
+replicas: 2
+zones:
+  - az-a
+  - az-b
+resources: {}
+#  requests:
+#    memory: 5Gi
+#    cpu: "2"
+
+service:
+  port: 3000
+
+# In-app HTTP response cache in MiB. 0 forces every request down to
+# DuckDB/ZeroFS (storage benchmark mode); 256 is the serving default.
+cacheMb: 256
+
+# Shared lake volume (one directory on the ZeroFS filesystem, ReadWriteMany).
+# storageClass must be a zerofs per-zone class; the name defaults to this
+# release's az-a class.
+persistence:
+  size: 1Gi
+  # storageClass: lake-lake-az-a
+
+# Optional single writer: hourly build + ref move (the ETL publisher).
+# The only component allowed to mutate refs.
+writer:
+  enabled: false
+  schedule: "0 * * * *"
+  bbox: 13.35,52.48,13.45,52.55
+  limit: 20000
+  collection: buildings
+
+# Subchart (Garage/Redis/gateways/CSI). Disable when pointing at an
+# existing ZeroFS estate (then set persistence.storageClass explicitly).
+zerofs:
+  enabled: true

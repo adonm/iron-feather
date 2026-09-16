@@ -1,2 +1,4 @@
 [toolchain]
-channel = "stable"
+# martin-tile-utils requires >= 1.98; pin the exact toolchain so just
+# recipes, kind image builds and CI all use the same compiler.
+channel = "1.98.1"

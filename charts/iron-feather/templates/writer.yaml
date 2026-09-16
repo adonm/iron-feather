@@ -1,0 +1,49 @@
+{{- if .Values.writer.enabled }}
+# Optional single writer (the only component allowed to mutate refs):
+# hourly build of a new immutable snapshot, data shared, then the ref move.
+# Disabled by default; enable for a self-managing stack.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "ifeather.fullname" . }}-writer
+spec:
+  schedule: {{ .Values.writer.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: topology.kubernetes.io/zone
+                        operator: In
+                        values: ["{{ .Values.zones | first }}"]
+          containers:
+            - name: publish
+              image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  sha="sha_$(date -u +%Y%m%dT%H%M)"
+                  iron-feather build --bbox={{ .Values.writer.bbox }} \
+                    --limit {{ .Values.writer.limit }} \
+                    --collection {{ .Values.writer.collection }} \
+                    --out "/lake/catalogs/$sha.ducklake" \
+                    --data-dir /lake/data/parquet
+                  printf '%s' "$sha.ducklake" > /lake/refs/latest
+                  echo "published $sha"
+              volumeMounts:
+                - name: lake
+                  mountPath: /lake
+          volumes:
+            - name: lake
+              persistentVolumeClaim:
+                claimName: {{ include "ifeather.fullname" . }}-lake
+{{- end }}

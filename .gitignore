@@ -8,3 +8,4 @@
 /.oy
 /workloads
 __pycache__/
+charts/*/charts/

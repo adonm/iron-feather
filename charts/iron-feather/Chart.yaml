@@ -1,0 +1,11 @@
+apiVersion: v2
+name: iron-feather
+description: OGC/Flight read pool over a ZeroFS-hosted DuckLake plus the optional single writer
+type: application
+version: 0.1.0
+appVersion: 0.1.0
+dependencies:
+  - name: zerofs
+    version: 0.1.0
+    repository: file://../zerofs
+    condition: zerofs.enabled

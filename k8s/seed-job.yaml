@@ -1,0 +1,45 @@
+# One-shot seeder: builds the Berlin snapshot straight into the lake PVC.
+# Mirrors what the optional writer CronJob does on its hourly cadence.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lake-seed-berlin
+  namespace: lake
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/zone
+                    operator: In
+                    values: ["az-a"]
+      containers:
+        - name: build
+          image: iron-feather:kind
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              mkdir -p /lake/refs/tags /lake/catalogs /lake/data/parquet
+              if [ ! -f /lake/catalogs/sha_berlin.ducklake ]; then
+                iron-feather build --bbox=13.35,52.48,13.45,52.55 --limit 20000 \
+                  --out /lake/catalogs/sha_berlin.ducklake \
+                  --data-dir /lake/data/parquet
+              fi
+              printf '%s' sha_berlin.ducklake > /lake/refs/latest
+              printf '%s' sha_berlin.ducklake > /lake/refs/main
+              echo seeded
+          volumeMounts:
+            - name: lake
+              mountPath: /lake
+      volumes:
+        - name: lake
+          persistentVolumeClaim:
+            claimName: lake-lake

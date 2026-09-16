@@ -58,6 +58,59 @@ builds and serves straight off the mount; after publishing a second snapshot
 and moving `refs/latest`, the old reader still serves its 15 west-edge
 features while the new reader returns 0 for the same query (pinned reads).
 
+## kind whole-stack (`charts/`)
+
+`just kind-up` (config in `k8s/kind-2az.yaml`) builds a 2-worker cluster
+with real `topology.kubernetes.io/zone` labels and node-local `/nvme`
+extraMounts. Two Helm charts manage the stack:
+
+- `charts/zerofs` — Garage (S3 stand-in) + Redis (CAS fencing) + one
+  ZeroFS gateway per zone (writer/leader + standby) with hostPath caches
+  on `/nvme`, the upstream CSI driver, and one StorageClass per zone.
+- `charts/iron-feather` — depends on `zerofs`; read-pool Deployment
+  (spread across zones, ref resolved once per pod, RO mount), Service,
+  shared RWX lake PVC, and the optional hourly writer CronJob
+  (`writer.enabled=true`) — the single ETL publisher.
+
+```sh
+just kind-up                  # cluster (skip if it exists)
+just kind-image               # build + kind load iron-feather:kind
+just kind-install             # helm upgrade --install (image.tag=kind)
+just kind-bootstrap-s3        # Garage layout + bucket + key -> lake-s3 Secret
+just kind-seed                # Berlin snapshot Job (mirrors the writer)
+just kind-bench               # fixed-pass http_bench via port-forward
+```
+
+Topology findings (verified, not assumed):
+
+- Independent leaders over one bucket **fence each other** (victim logs
+  `compactor ... Fenced`); standbys **refuse 9P** until failover. So the
+  chart runs writer/leader + standby, and every zone's StorageClass points
+  at the writer today — the per-zone names are the routing seam for a
+  future read-serving replica (values-only switch).
+- The vendored CSI manifests drop upstream's livenessprobe sidecar: in this
+  environment it never serves `:9808`, so kubelet SIGTERMs the healthy
+  plugin into a CrashLoop (node plugins now run 0 restarts). Revisit
+  outside kind.
+- DaemonSet `OnDelete` is kept from upstream: deleting node-plugin pods is
+  the deliberate per-node upgrade path.
+- Fresh containers have an empty extension dir, so `setup_session` now
+  INSTALLs every extension on demand (and the image bakes them) instead of
+  assuming a warm cache.
+
+## Benchmark: kind vs host (Berlin 20k, 500-req mixed, `--cache-mb 0`)
+
+| Setup | Pass 1 (engine cold) | Pass 2 (engine warm) |
+|---|---|---|
+| kind, CSI mount, 2 pods (port-forward fans out) | 105 rps, p50 63 ms, p99 163 ms | 88 rps, p50 72 ms, p99 182 ms |
+| host, direct FUSE mount, 1 process | 126 rps, p50 51 ms, p99 139 ms | 98 rps, p50 66 ms, p99 141 ms |
+
+Same order of magnitude (~15–20% kind overhead: extra 9P hop +
+kubelet bind-mount + port-forward; snapshots differ but share
+region/shape/row count). Gateway caches were warm both sides (seed/build
+traffic); DuckDB buffers cold on pass 1. With the default 256 MiB app
+cache the same workload serves ~6k rps from memory either way.
+
 ## Production mapping
 
 - One ZeroFS server per AZ replaces this rig's single server; the CSI

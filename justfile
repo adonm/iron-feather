@@ -107,6 +107,55 @@ lake-serve ref="latest" *args: zerofs-up
     catalog=$(bash scripts/lake_ref.sh get {{quote(ref)}})
     cargo run --locked --release -- serve --shard "$MNT/catalogs/$catalog" {{args}}
 
+# --- kind whole-stack ------------------------------------------------------
+# 2-AZ kind cluster (nodes carry topology.kubernetes.io/zone; /nvme is the
+# node-local NVMe stand-in). sidecars pull from the public registries.
+
+# Create the 2-worker cluster (idempotent-ish; deletes nothing).
+kind-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kind get clusters | grep -qx lake && exit 0
+    mkdir -p /tmp/opencode/kind-nvme-a /tmp/opencode/kind-nvme-b
+    kind create cluster --config k8s/kind-2az.yaml
+
+kind-down:
+    kind delete cluster --name lake
+
+# Build the serve image and load it into kind.
+kind-image:
+    docker build -t iron-feather:kind .
+    kind load docker-image iron-feather:kind --name lake
+
+# Install/upgrade the whole stack (zerofs cache layer + read pool).
+# image.tag=kind matches `just kind-image`; writer stays off unless asked.
+kind-install *args:
+    helm dependency update charts/iron-feather >/dev/null
+    helm upgrade --install lake charts/iron-feather --namespace lake --create-namespace --set image.tag=kind {{args}}
+
+# One-time S3 bootstrap: Garage layout + bucket + key -> lake-s3 Secret.
+# Run after kind-install (gateways wait on the Secret, then start).
+kind-bootstrap-s3:
+    NS=lake bash scripts/kind_bootstrap_s3.sh
+
+# Deterministic Berlin workload (seed 7; regenerates byte-identical).
+workloads-berlin dir="workloads/berlin":
+    python3 scripts/make_berlin_workload.py --out-dir {{quote(dir)}}
+
+# Berlin benchmark against a port-forwarded read pool (cacheMb=0 for
+# storage numbers; default 256 measures the app response cache instead).
+kind-bench base="http://127.0.0.1:3000" workload="workloads/berlin/mixed.txt": workloads-berlin
+    cargo run --locked --release --example http_bench -- --base {{quote(base)}} --concurrency 8 --passes 1 --warmup-secs 0 --workload {{quote(workload)}}
+
+kind-status:
+    kubectl -n lake get pods,statefulsets,pvc,storageclasses 2>&1 | head -30
+
+# Seed the lake volume with the Berlin snapshot (same shape as the writer).
+kind-seed:
+    kubectl apply -f k8s/seed-job.yaml
+    kubectl -n lake wait --for=condition=complete --timeout=1200s job/lake-seed-berlin
+    kubectl -n lake logs job/lake-seed-berlin | tail -2
+
 # Smoke-check a running lake server (default: local :3000).
 lake-verify base="http://127.0.0.1:3000":
     #!/usr/bin/env bash

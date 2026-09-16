@@ -417,21 +417,20 @@ pub fn catalog_url(location: &str) -> String {
 /// Storage caching (Parquet/HTTP block and metadata caches) lives in the
 /// ZeroFS layer below the mount, not in DuckDB: no cache tuning here.
 fn setup_session(conn: &NeoConnection, _cfg: &StoreConfig, _remote: bool) -> Result<(), Error> {
-    // Extensions load first; ducklake installs on demand once, then loads
-    // offline like spatial does.
-    if db::execute_all(conn, &["LOAD ducklake"]).is_err() {
-        db::execute_all(conn, &["INSTALL ducklake", "LOAD ducklake"])?;
+    // Every extension installs on demand (fresh containers have an empty
+    // extension dir), then the lockdown below freezes further installs.
+    for ext in ["ducklake", "spatial", "httpfs"] {
+        if db::execute_all(conn, &[&format!("LOAD {ext}")]).is_err() {
+            db::execute_all(conn, &[&format!("INSTALL {ext}"), &format!("LOAD {ext}")])?;
+        }
     }
     db::execute_all(
         conn,
         &[
             "SET autoinstall_known_extensions=false",
             "SET autoload_known_extensions=false",
-            "LOAD spatial",
-            "LOAD httpfs",
         ],
-    )?;
-    Ok(())
+    )
 }
 
 impl Store {

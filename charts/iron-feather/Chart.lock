@@ -1,0 +1,6 @@
+dependencies:
+- name: zerofs
+  repository: file://../zerofs
+  version: 0.1.0
+digest: sha256:216b1b749ab8dffcd1c60af8f0dde50f6f8a2872d6e9453f4aed439b1bf69c01
+generated: "2026-09-17T07:29:19.37333301+08:00"

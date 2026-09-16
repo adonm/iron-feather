@@ -1,0 +1,190 @@
+# Upstream zerofs-csi driver (csi.zerofs.net), namespaced to the release.
+# Source: Barre/ZeroFS zerofs/zerofs-csi/deploy at v2.3.3; images pinned
+# via values. The AZ routing seam lives in storageclass.yaml, not in a
+# driver fork: each zone gets a StorageClass pointing at its zone gateway.
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.zerofs.net
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zerofs-csi-controller
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zerofs-csi-node
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zerofs-csi-controller
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # The provisioner secret referenced by the StorageClass is read for
+  # DeleteVolume.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zerofs-csi-controller
+subjects:
+  - kind: ServiceAccount
+    name: zerofs-csi-controller
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: zerofs-csi-controller
+  apiGroup: rbac.authorization.k8s.io
+---
+# Leader election for the provisioner sidecar.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: zerofs-csi-provisioner-leader-election
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zerofs-csi-provisioner-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: zerofs-csi-controller
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: zerofs-csi-provisioner-leader-election
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zerofs-csi-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-csi-controller
+  template:
+    metadata:
+      labels:
+        app: zerofs-csi-controller
+    spec:
+      serviceAccountName: zerofs-csi-controller
+      containers:
+        - name: zerofs-csi
+          image: {{ .Values.images.csi }}
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-provisioner
+          image: {{ .Values.images.provisioner }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zerofs-csi-node
+spec:
+  selector:
+    matchLabels:
+      app: zerofs-csi-node
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        app: zerofs-csi-node
+    spec:
+      serviceAccountName: zerofs-csi-node
+      tolerations:
+        - operator: Exists
+      priorityClassName: system-node-critical
+      containers:
+        - name: zerofs-csi
+          image: {{ .Values.images.csi }}
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: dev-fuse
+              mountPath: /dev/fuse
+        - name: node-driver-registrar
+          image: {{ .Values.images.registrar }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi.zerofs.net/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/csi.zerofs.net
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: dev-fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice

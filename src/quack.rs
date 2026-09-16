@@ -156,19 +156,16 @@ fn setup_quack_session(
     catalog: &str,
     snapshot: i64,
 ) -> Result<(), Error> {
-    if db::execute_all(conn, &["LOAD quack"]).is_err() {
-        db::execute_all(conn, &["INSTALL quack", "LOAD quack"])?;
-    }
-    if db::execute_all(conn, &["LOAD ducklake"]).is_err() {
-        db::execute_all(conn, &["INSTALL ducklake", "LOAD ducklake"])?;
+    for ext in ["quack", "ducklake", "spatial", "httpfs"] {
+        if db::execute_all(conn, &[&format!("LOAD {ext}")]).is_err() {
+            db::execute_all(conn, &[&format!("INSTALL {ext}"), &format!("LOAD {ext}")])?;
+        }
     }
     db::execute_all(
         conn,
         &[
             "SET autoinstall_known_extensions=false",
             "SET autoload_known_extensions=false",
-            "LOAD spatial",
-            "LOAD httpfs",
         ],
     )?;
     let _ = (cfg, remote);
