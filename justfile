@@ -62,25 +62,59 @@ bench-matrix base="http://127.0.0.1:3000" dir="workloads/nw-europe" passes="2":
     cargo run --locked --release --example http_bench -- --base "$base" --concurrency 4 --passes 1 --warmup-secs 0 --workload "$wdir/broad.txt"
     cargo run --locked --release --example http_bench -- --base "$base" --concurrency 4 --passes 1 --warmup-secs 0 --workload "$wdir/deep.txt"
 
-# DuckDB storage-cache A/B: fresh process per case, 1 cold + 1 warm urban
-# pass over loopback rclone S3. Compares stock settings against the tuned
-# defaults. See docs/nw-europe-10gib.md.
-bench-duck-cache shard="http://127.0.0.1:19000/catalog/nw-europe-lake.ducklake":
+# --- ZeroFS lake rig -------------------------------------------------------
+# Local rehearsal of the AZ-local cache design (see docs/zerofs-lake.md):
+# Garage (S3) + Redis fencing + ZeroFS 9P + FUSE mount at /tmp/opencode.
+# All block/metadata caching lives in ZeroFS; serve reads plain local paths.
+
+# Install the pinned zerofs binary (no package manager).
+zerofs-setup:
+    python3 scripts/setup_zerofs.py
+
+# Start Garage + Redis + ZeroFS server + FUSE mount (idempotent).
+zerofs-up: zerofs-setup
+    bash scripts/zerofs_up.sh
+
+# Stop the mount and server. Pass --wipe to drop containers and cached state.
+zerofs-down *args:
+    bash scripts/zerofs_down.sh {{args}}
+
+# Create the /lake layout (refs, catalogs, data) on the mount.
+lake-init: zerofs-up
     #!/usr/bin/env bash
     set -euo pipefail
-    bench() {
-      echo "=== $1 ==="
-      cargo run --locked --release -- serve --shard {{quote(shard)}} --listen 127.0.0.1:3000 --flight-listen 127.0.0.1:50051 --connections 8 --cache-mb 0 ${@:2} &
-      SRV=$!
-      for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:3000/healthz && break; sleep 1; done
-      curl -s http://127.0.0.1:3000/metrics | grep duck_
-      cargo run --locked --release --example http_bench -- --base http://127.0.0.1:3000 --concurrency 8 --passes 1 --warmup-secs 0 --workload workloads/nw-europe/urban.txt
-      cargo run --locked --release --example http_bench -- --base http://127.0.0.1:3000 --concurrency 8 --passes 1 --warmup-secs 0 --workload workloads/nw-europe/urban.txt
-      curl -s http://127.0.0.1:3000/metrics | grep -E "duck_external|http_requests"
-      kill $SRV; wait $SRV 2>/dev/null || true
-    }
-    bench "stock (all caches off)" --disable-http-metadata-cache --disable-parquet-metadata-cache --enable-cache-validation --memory-mb 0
-    bench "tuned defaults (4 GiB)" --memory-mb 4096
+    MNT=/tmp/opencode/lake-mnt
+    mkdir -p "$MNT/refs/tags" "$MNT/catalogs" "$MNT/data/parquet"
+    ls "$MNT"
+
+# Publish a new immutable snapshot, then move a ref at it.
+# This plays the catalog API locally; in prod only the API mutates refs.
+# Example: just lake-publish sha_003 --bbox=13.38,52.50,13.42,52.54 --limit 20000
+lake-publish sha *args: zerofs-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    MNT=/tmp/opencode/lake-mnt
+    cargo run --locked -- build --out "$MNT/catalogs/{{quote(sha)}}.ducklake" --data-dir "$MNT/data/parquet" {{args}}
+    bash scripts/lake_ref.sh set "{{quote(sha)}}.ducklake" latest
+    bash scripts/lake_ref.sh list
+
+# Serve the catalog a ref points at (default: latest), resolved once at
+# startup; the reader stays pinned to that snapshot across later publishes.
+lake-serve ref="latest" *args: zerofs-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    MNT=/tmp/opencode/lake-mnt
+    catalog=$(bash scripts/lake_ref.sh get {{quote(ref)}})
+    cargo run --locked --release -- serve --shard "$MNT/catalogs/$catalog" {{args}}
+
+# Smoke-check a running lake server (default: local :3000).
+lake-verify base="http://127.0.0.1:3000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    curl -sf "{{base}}/healthz"
+    curl -sf "{{base}}/collections" | head -c 200; echo
+    curl -sf "{{base}}/collections/buildings/items?sources=1&limit=1" | head -c 200; echo
+    curl -s "{{base}}/metrics" | head -12
 
 run shard="fixtures/osm.ducklake" *args: setup-duckdb
     cargo run --locked --release -- serve --shard {{quote(shard)}} {{args}}

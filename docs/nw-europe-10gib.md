@@ -7,10 +7,12 @@
 > `scripts/build_ducklake.sh` no longer exist — `build` now writes the lake
 > layout directly (`--sort grid|hilbert|none --file-mb N --row-group N`).
 > The `--duck-disk-cache-dir` experiment below is also gone (`cache_httpfs`
-> has no 2.0 build); current tuning is HTTP/Parquet metadata caches plus
-> `NO_VALIDATION`. All DuckDB access since runs through the stable v2 C API,
-> and Quack serves the pinned snapshot as the bulk protocol (see README).
-> Re-run the matrix on the nightly before quoting ratios.
+> has no 2.0 build), and the remaining app-level storage tuning (HTTP/Parquet
+> metadata caches, `NO_VALIDATION`) is gone too: all block/metadata caching
+> now lives in ZeroFS below the mount (see `docs/zerofs-lake.md`). All DuckDB
+> access since runs through the stable v2 C API, and Quack serves the pinned
+> snapshot as the bulk protocol (see README). Re-run the matrix on the
+> nightly before quoting ratios.
 
 Question: what does serving a ~10 GB shard look like, and does heap layout
 matter for direct S3 attachment? All runs below are loopback (no real S3
@@ -306,53 +308,17 @@ and re-run `just bench-layouts` against real-region S3 before committing:
 loopback excludes round-trip time, which multiplies the GET-count advantage
 further.
 
-## DuckDB HTTP/S3 caching: benchmarked target
+## DuckDB HTTP/S3 caching: superseded by ZeroFS
 
-`just bench-duck-cache` (loopback rclone S3, release, 8 conns, `--cache-mb
-0`, urban 126 urls, 1 cold + 1 warm pass per fresh process):
+The matrix below (loopback rclone S3, 8 conns, `--cache-mb 0`, urban 126
+urls) motivated the old app-level tuning, which has since been removed:
+all block/metadata caching now lives in ZeroFS below the mount
+(`docs/zerofs-lake.md`). Kept as a sizing record — the durable finding is
+that the **DuckDB memory budget dominates** (1 GiB thrashes; 4 GiB holds the
+urban working set), hence the `--memory-mb` default of 4096.
 
 | Case | Cold | Warm (same process) |
 |---|---|---|
 | lake stock (all caches off, VALIDATE_ALL, unlimited mem) | 19 rps, p50 288 ms, 20.8 GETs/req | 27 rps, p50 140 ms, 0.05 GETs/req |
 | lake tuned defaults (4 GiB) | 23 rps, p50 274 ms, 19.9 GETs/req | 25 rps, p50 136 ms, 0.05 GETs/req |
-| lake tuned + prefetch-all | 23 rps, p50 273 ms, 19.8 GETs/req | 27 rps, p50 142 ms, 0.02 GETs/req |
 | lake tuned 1 GiB (pressure) | 19 rps, p50 306 ms, 39.7 GETs/req | 14 rps, p50 317 ms, 48.6 GETs/req |
-| native stock vs tuned | identical (10 vs 9 rps cold, 37.9 GETs/req; 0 GETs warm) | — |
-
-Persistent disk cache (`--duck-disk-cache-dir`, 512 KiB blocks, lake):
-
-| Case | Result |
-|---|---|
-| populate (empty disk) | 16 rps, p50 288 ms, 43.7 GETs/req, 1.8 GB on disk |
-| restart, warm disk | 21 rps, p50 173 ms, **0 GETs** |
-| restart, empty disk (control) | 20 rps, p50 295 ms, 44.1 GETs/req |
-
-Findings:
-
-- The **memory budget dominates**: 1 GiB thrashes (2x cold GETs, warm pass
-  re-fetches everything: 48.6 GETs/req), while 4 GiB holds the ~1.8 GB urban
-  external-file-cache working set with zero warm GETs. Hence the new
-  `--memory-mb` default of 4096 (0 = unlimited remains available).
-- Built-in caches (HTTP metadata, Parquet metadata, connection reuse,
-  NO_VALIDATION) are small but free on loopback (+20% cold throughput,
-  −4% GETs) and grow with real S3 round-trip time, where each saved HEAD
-  and revalidation matters. They are **on by default**; every flag has an
-  opt-out. Prefetch-all shows no urban win and stays off (wide-scan opt-in).
-- `cache_httpfs` disk cache is the only restart-persistent layer: warm disk
-  serves cold processes with zero S3 traffic at RAM-like latency. Cost: ~2x
-  cold-populate GET amplification (block-aligned 512 KiB reads) and an extra
-  extension + disk provisioning. It stays **opt-in** (`--duck-disk-cache-dir`)
-  for restart-heavy deployments, not the default.
-- Bug fixed along the way: `try_clone` does not reliably inherit httpfs
-  storage SETs, so the pool now tunes **every** connection (previously only
-  the opener was tuned; 7/8 conns silently ran stock). `/metrics` reports
-  the effective `duck_setting_*` values plus
-  `duck_external_cache_ranges/bytes` so benches can verify tuning stuck.
-- Native single-file reads are storage-block traffic, not metadata traffic:
-  tuning is neutral there (identical GETs); memory sizing still applies.
-
-Pragmatic final target (now the defaults): built-in caches on,
-NO_VALIDATION for immutable URLs, prefetch off, 4 GiB DuckDB memory, no
-disk cache unless restarts dominate. Re-run `just bench-duck-cache` against
-real S3 before quoting external ratios: loopback hides HEAD/TLS latency,
-which only widens the tuned gap.

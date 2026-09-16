@@ -212,11 +212,10 @@ lane. `--threads` sets shared DuckDB threads for the whole process
 (default 1; keep at 1 for many small concurrent queries, raise only with
 fewer connections for bulk) and `--memory-mb` caps shared DuckDB memory in
 MiB (default 4096, sized for the ~10 GB shard urban working set; 0 leaves
-DuckDB's unbounded default). Remote shards also enable DuckDB's HTTP
-metadata cache, Parquet metadata cache and `NO_VALIDATION` for the immutable
-external-file cache by default; each can be flipped
-(`--disable-http-metadata-cache`, `--disable-parquet-metadata-cache`,
-`--enable-cache-validation`). `--query-timeout-ms` interrupts HTTP and Flight
+DuckDB's unbounded default). Parquet/HTTP block and metadata caching lives
+in ZeroFS below the mount, not in DuckDB: there are no storage-tuning flags
+by design (see [`docs/zerofs-lake.md`](docs/zerofs-lake.md)).
+`--query-timeout-ms` interrupts HTTP and Flight
 queries past their deadline (default 30000; 0 disables). Queries run on blocking
 workers with one bounded lifecycle: cancellation is owned from before
 execution through final delivery, the worker clears its interrupt handle
@@ -230,10 +229,10 @@ bytes, with a `--cache-mb` budget (default 256 MiB). Set `--cache-mb 0` to
 measure the uncached path. `/metrics` is `no-store` and reports
 `cache_requests` (lookups), `http_requests`, `cache_hits` (fast-path),
 `cache_coalesced` (shared waiters), `cache_computes`, `cache_failures`,
-`cache_evictions`, plus `duck_external_cache_ranges/bytes` and the effective
-`duck_setting_*` storage tuning. See
-[`docs/nw-europe-10gib.md`](docs/nw-europe-10gib.md) for the benchmarked
-tradeoffs (`just bench-duck-cache`).
+`cache_evictions`, plus `duck_setting_*` engine budgets (threads, memory).
+Storage-cache benchmarks now live behind the mount instead: see
+[`docs/zerofs-lake.md`](docs/zerofs-lake.md) for the local rig
+(`just zerofs-up`, `just lake-publish`, `just lake-serve`).
 Error responses are always `Cache-Control: no-store` and carry no ETag.
 
 GeoJSON embeds DuckDB's geometry/properties text without a Rust-side

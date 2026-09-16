@@ -1433,68 +1433,19 @@ fn manifest_round_trips_through_serde() {
     assert_eq!(back.schema_version, 2);
 }
 
-#[test]
-fn duck_tuning_defaults_are_pragmatic() {
-    use crate::store::StoreConfig;
-    let cfg = StoreConfig::default();
-    assert!(cfg.http_metadata_cache);
-    assert!(cfg.parquet_metadata_cache);
-    assert!(cfg.no_validation);
-}
-
 #[tokio::test]
-async fn duck_tuning_flags_reach_duckdb_settings() {
-    use crate::store::StoreConfig;
+async fn duck_tuning_reports_engine_budgets() {
+    // Storage caching lives in ZeroFS; DuckDB only reports engine budgets.
     let fixture = Fixture::new(1);
-    // Local open leaves defaults alone; tuning query still works.
     let tuning = fixture.store.duck_tuning().await;
-    assert!(!tuning.is_empty());
-    let stats = fixture.store.duck_cache_stats().await;
-    // Local file: external cache table exists, may be empty.
-    assert_eq!(stats.ranges, 0);
-
-    // Remote tuning applies to scratch connections (no ATTACH needed to
-    // verify the SETs bind on this DuckDB version).
-    let db = db::open_memory().unwrap();
-    let conn = db.connect().unwrap();
-    db::execute_all(&conn, &["LOAD httpfs"]).unwrap();
-    let cfg = StoreConfig {
-        http_metadata_cache: true,
-        parquet_metadata_cache: true,
-        no_validation: true,
-        ..StoreConfig::default()
-    };
-    crate::store::apply_remote_tuning(&conn, &cfg, true).unwrap();
-    // Fresh sessions start from defaults, so the pool tunes every
-    // connection individually.
-    let fresh = db.connect().unwrap();
-    crate::store::apply_remote_tuning(&fresh, &cfg, true).unwrap();
-    let get_fresh = |name: &str| {
-        db::strings_col(
-            &fresh,
-            &format!("SELECT value FROM duckdb_settings() WHERE name='{name}'"),
-        )
-        .unwrap()
-        .pop()
-        .unwrap()
-    };
-    let get = |name: &str| {
-        db::strings_col(
-            &conn,
-            &format!("SELECT value FROM duckdb_settings() WHERE name='{name}'"),
-        )
-        .unwrap()
-        .pop()
-        .unwrap()
-    };
-    assert_eq!(get("enable_http_metadata_cache"), "true");
-    assert_eq!(get("parquet_metadata_cache"), "true");
-    assert_eq!(get("validate_external_file_cache"), "NO_VALIDATION");
-    assert_eq!(get_fresh("enable_http_metadata_cache"), "true");
+    let keys: Vec<_> = tuning.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(keys.contains(&"threads"));
+    assert!(keys.contains(&"memory_limit"));
+    assert!(!keys.iter().any(|k| k.contains("metadata_cache")));
 }
 
 #[tokio::test]
-async fn metrics_exposes_duck_cache_occupancy() {
+async fn metrics_exposes_engine_budgets() {
     let fixture = Fixture::new(1);
     let client = TestClient::new(api::routes(fixture.store));
     let text = client
@@ -1506,9 +1457,9 @@ async fn metrics_exposes_duck_cache_occupancy() {
         .into_string()
         .await
         .unwrap();
-    assert!(text.contains("duck_external_cache_ranges"));
-    assert!(text.contains("duck_external_cache_bytes"));
-    assert!(text.contains("duck_setting_enable_http_metadata_cache"));
+    assert!(text.contains("duck_setting_threads"));
+    assert!(text.contains("duck_setting_memory_limit"));
+    assert!(!text.contains("metadata_cache"));
 }
 
 // --- Quack bulk protocol -----------------------------------------------

@@ -101,28 +101,6 @@ pub fn text_table(conn: &NeoConnection, sql: &str) -> Result<Vec<Vec<Option<Stri
     Ok(out)
 }
 
-/// Every column of every row as nullable BIGINT. Callers use this for
-/// counts and ids; overflows surface as errors, not silent truncation.
-pub fn int_table(conn: &NeoConnection, sql: &str) -> Result<Vec<Vec<Option<i64>>>, Error> {
-    let mut out = Vec::new();
-    for chunk in conn.query(sql, Parameters::None)? {
-        let chunk = chunk?;
-        let ncols = chunk.vectors_count()?;
-        let mut cols = Vec::with_capacity(ncols);
-        for c in 0..ncols {
-            cols.push(chunk.get_vector_at::<i64>(c)?);
-        }
-        for i in 0..chunk.row_count()? {
-            let mut row = Vec::with_capacity(ncols);
-            for col in &cols {
-                row.push(col.get(i)?.copied());
-            }
-            out.push(row);
-        }
-    }
-    Ok(out)
-}
-
 /// Single BIGINT cell. Errors on zero or multiple rows.
 pub fn int_one(conn: &NeoConnection, sql: &str) -> Result<i64, Error> {
     let mut result = conn.query(sql, Parameters::None)?;

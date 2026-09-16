@@ -244,15 +244,15 @@ fn health(Query(_): Query<NoQuery>) -> &'static str {
 /// with `no-store`: hit rate over lookups is `(hits + coalesced) /
 /// requests`; `http_requests` counts HTTP responses attempted (one request
 /// can cause up to two lookups: gzip then identity); `failures` counts miss
-/// executions that errored and were not cached. `duck_*` lines report the
-/// DuckDB external-file-cache occupancy (ranges/bytes) best-effort.
+/// executions that errored and were not cached. Storage-block caching lives
+/// in ZeroFS below the mount; `duck_setting_*` lines report engine budgets
+/// only.
 #[handler]
 async fn metrics(Query(_): Query<NoQuery>, Data(store): Data<&Arc<Store>>) -> Response {
     let stats = store.cache_stats();
-    let duck = store.duck_cache_stats().await;
     let tuning = store.duck_tuning().await;
     let mut out = format!(
-        "cache_entries {}\ncache_weight_bytes {}\ncache_requests {}\nhttp_requests {}\ncache_hits {}\ncache_coalesced {}\ncache_computes {}\ncache_failures {}\ncache_evictions {}\nduck_external_cache_ranges {}\nduck_external_cache_bytes {}\n",
+        "cache_entries {}\ncache_weight_bytes {}\ncache_requests {}\nhttp_requests {}\ncache_hits {}\ncache_coalesced {}\ncache_computes {}\ncache_failures {}\ncache_evictions {}\n",
         stats.entries,
         stats.weight_bytes,
         stats.requests,
@@ -262,8 +262,6 @@ async fn metrics(Query(_): Query<NoQuery>, Data(store): Data<&Arc<Store>>) -> Re
         stats.computes,
         stats.failures,
         stats.evictions,
-        duck.ranges,
-        duck.bytes,
     );
     for (key, value) in tuning {
         out.push_str(&format!("duck_setting_{key} {value}\n"));

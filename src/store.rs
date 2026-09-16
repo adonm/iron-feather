@@ -84,15 +84,6 @@ pub struct StoreConfig {
     pub flight_stream_bytes: usize,
     /// Process-wide Flight buffer in bytes across all streams.
     pub flight_total_bytes: usize,
-    /// Cache HTTP object metadata (HEAD/ETag) globally. Safe for immutable
-    /// versioned shards; avoids a HEAD per range read on repeat access.
-    pub http_metadata_cache: bool,
-    /// Cache Parquet footers/metadata for repeated reads of the same files.
-    pub parquet_metadata_cache: bool,
-    /// Skip external-file-cache revalidation (NO_VALIDATION) for remote
-    /// shards. Safe only for immutable versioned URLs; avoids HEAD
-    /// revalidation on warm buffers.
-    pub no_validation: bool,
 }
 
 impl Default for StoreConfig {
@@ -109,18 +100,8 @@ impl Default for StoreConfig {
             query_timeout: Duration::from_millis(30_000),
             flight_stream_bytes: FLIGHT_BYTE_BUDGET,
             flight_total_bytes: FLIGHT_TOTAL_BUDGET,
-            http_metadata_cache: true,
-            parquet_metadata_cache: true,
-            no_validation: true,
         }
     }
-}
-
-/// Point-in-time DuckDB storage-cache occupancy (best-effort; 0 on error).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DuckCacheStats {
-    pub ranges: u64,
-    pub bytes: u64,
 }
 
 pub struct ArrowResult {
@@ -430,11 +411,12 @@ pub fn catalog_url(location: &str) -> String {
     format!("ducklake:{}", location.trim_end_matches('/'))
 }
 
-/// Full per-connection setup: extensions, remote tuning, then the catalog
-/// attach pinned to `snapshot` (`None` resolves it first). Every pooled
-/// connection runs the session part; the ATTACH itself is database-level
-/// and done once (see [`Store::open_config`]).
-fn setup_session(conn: &NeoConnection, cfg: &StoreConfig, remote: bool) -> Result<(), Error> {
+/// Full per-connection setup: extensions, then the catalog attach pinned to
+/// `snapshot`. Every pooled connection runs the session part; the ATTACH
+/// itself is database-level and done once (see [`Store::open_config`]).
+/// Storage caching (Parquet/HTTP block and metadata caches) lives in the
+/// ZeroFS layer below the mount, not in DuckDB: no cache tuning here.
+fn setup_session(conn: &NeoConnection, _cfg: &StoreConfig, _remote: bool) -> Result<(), Error> {
     // Extensions load first; ducklake installs on demand once, then loads
     // offline like spatial does.
     if db::execute_all(conn, &["LOAD ducklake"]).is_err() {
@@ -449,39 +431,7 @@ fn setup_session(conn: &NeoConnection, cfg: &StoreConfig, remote: bool) -> Resul
             "LOAD httpfs",
         ],
     )?;
-    // Remote storage tuning before ATTACH so the catalog open and all
-    // later reads use it. Local shards skip this entirely.
-    apply_remote_tuning(conn, cfg, remote)?;
     Ok(())
-}
-
-/// DuckDB storage-layer tuning for remote shards. Built-in caches first:
-/// HTTP metadata, Parquet metadata, and (for immutable versioned URLs)
-/// NO_VALIDATION skip revalidation on warm buffers.
-pub(crate) fn apply_remote_tuning(
-    conn: &NeoConnection,
-    cfg: &StoreConfig,
-    remote: bool,
-) -> Result<(), Error> {
-    if !remote {
-        return Ok(());
-    }
-    // httpfs-owned settings fail when the extension isn't loaded (autoload
-    // is off), so load it before any SET. Installed in all serve images.
-    db::execute_all(
-        conn,
-        &[
-            "LOAD httpfs",
-            "SET enable_external_file_cache=true",
-            &format!("SET enable_http_metadata_cache={}", cfg.http_metadata_cache),
-            &format!("SET parquet_metadata_cache={}", cfg.parquet_metadata_cache),
-            if cfg.no_validation {
-                "SET validate_external_file_cache='NO_VALIDATION'"
-            } else {
-                "SET validate_external_file_cache='VALIDATE_ALL'"
-            },
-        ],
-    )
 }
 
 impl Store {
@@ -580,13 +530,11 @@ impl Store {
                 "USE shard",
             ],
         )?;
-        apply_remote_tuning(&opener, &cfg, remote)?;
         let mut pool = Vec::with_capacity(cfg.connections);
         for _ in 0..cfg.connections {
             let conn = db.connect()?;
             setup_session(&conn, &cfg, remote)?;
             db::execute_all(&conn, &["USE shard"])?;
-            apply_remote_tuning(&conn, &cfg, remote)?;
             pool.push(conn);
         }
         drop(opener);
@@ -651,47 +599,13 @@ impl Store {
         }
     }
 
-    /// Best-effort DuckDB external-file-cache occupancy. Queries one pooled
-    /// connection; returns zeroes if the pool is busy or the function is
-    /// unavailable (e.g. local-only tests). Never fails `/metrics`.
-    pub async fn duck_cache_stats(&self) -> DuckCacheStats {
-        self.run(|conn| {
-            let rows = db::int_table(
-                conn,
-                "SELECT count(*)::BIGINT, coalesce(sum(nr_bytes), 0)::BIGINT FROM duckdb_external_file_cache()",
-            )
-            .map_err(|_| Error::Overloaded)?;
-            let (ranges, bytes) = match rows.first() {
-                Some(row) => (
-                    row[0].unwrap_or(0),
-                    row[1].unwrap_or(0),
-                ),
-                None => (0, 0),
-            };
-            Ok(DuckCacheStats {
-                ranges: ranges.max(0) as u64,
-                bytes: bytes.max(0) as u64,
-            })
-        })
-        .await
-        .unwrap_or_default()
-    }
-
-    /// Current DuckDB storage-tuning actually in effect (for /metrics and
-    /// bench logs). Reads GLOBAL settings on a pooled connection.
+    /// Storage-cache tuning actually in effect. All block/metadata caching
+    /// lives in the ZeroFS layer below the mount; DuckDB only reports its
+    /// engine budgets here so bench logs stay comparable.
     pub async fn duck_tuning(&self) -> Vec<(String, String)> {
         self.run(|conn| {
             let mut out = Vec::new();
-            for key in [
-                "enable_external_file_cache",
-                "enable_http_metadata_cache",
-                "parquet_metadata_cache",
-                "validate_external_file_cache",
-                "external_file_cache_remote_block_size",
-                "async_threads",
-                "threads",
-                "memory_limit",
-            ] {
+            for key in ["threads", "memory_limit"] {
                 let rows = db::text_table(
                     conn,
                     &format!("SELECT value FROM duckdb_settings() WHERE name='{key}'"),

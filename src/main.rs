@@ -70,16 +70,6 @@ enum Command {
         /// Process-wide Flight buffer in MiB across all streams.
         #[arg(long, default_value_t = 128)]
         flight_total_mb: u64,
-        /// Disable DuckDB HTTP metadata cache (default: enabled for remote).
-        #[arg(long)]
-        disable_http_metadata_cache: bool,
-        /// Disable DuckDB Parquet metadata cache (default: enabled).
-        #[arg(long)]
-        disable_parquet_metadata_cache: bool,
-        /// Re-enable external-file-cache validation (default: NO_VALIDATION
-        /// for remote immutable shards). Only set for mutable URLs.
-        #[arg(long)]
-        enable_cache_validation: bool,
         /// Quack bulk-protocol listen address. On by default; serves the
         /// same pinned snapshot through a locked-down read-only view.
         #[arg(long, default_value = "127.0.0.1:9494")]
@@ -121,9 +111,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             query_timeout_ms,
             flight_stream_mb,
             flight_total_mb,
-            disable_http_metadata_cache,
-            disable_parquet_metadata_cache,
-            enable_cache_validation,
             quack_listen,
             no_quack,
             quack_token,
@@ -146,9 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 query_timeout: std::time::Duration::from_millis(query_timeout_ms),
                 flight_stream_bytes: (flight_stream_mb.max(1) * 1024 * 1024) as usize,
                 flight_total_bytes: (flight_total_mb.max(1) * 1024 * 1024) as usize,
-                http_metadata_cache: !disable_http_metadata_cache,
-                parquet_metadata_cache: !disable_parquet_metadata_cache,
-                no_validation: !enable_cache_validation,
             };
             let store = Arc::new(store::Store::open_config(config.clone())?);
             tracing::info!(%listen, %flight_listen, %shard, snapshot = store.snapshot, "serving shard");

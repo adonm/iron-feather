@@ -171,7 +171,7 @@ fn setup_quack_session(
             "LOAD httpfs",
         ],
     )?;
-    crate::store::apply_remote_tuning(conn, cfg, remote)?;
+    let _ = (cfg, remote);
     db::execute_all(
         conn,
         &[
@@ -190,6 +190,5 @@ fn setup_quack_session(
             "SET GLOBAL quack_authorization_function = 'memory.main.quack_guard'",
         ],
     )?;
-    crate::store::apply_remote_tuning(conn, cfg, remote)?;
     Ok(())
 }
