@@ -184,7 +184,7 @@ impl FlightService for ShardFlight {
             .await?;
         let schema = SchemaAsIpc::new(&result.schema, &Default::default())
             .try_into()
-            .map_err(|e: duckdb::arrow::error::ArrowError| Status::internal(e.to_string()))?;
+            .map_err(|e: arrow::error::ArrowError| Status::internal(e.to_string()))?;
         Ok(Response::new(schema))
     }
 
@@ -237,7 +237,7 @@ impl FlightService for ShardFlight {
                         Some((
                             Ok(batch)
                                 as Result<
-                                    duckdb::arrow::record_batch::RecordBatch,
+                                    arrow::record_batch::RecordBatch,
                                     arrow_flight::error::FlightError,
                                 >,
                             (rx, guard, buffered, global),

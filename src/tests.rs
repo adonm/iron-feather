@@ -1,19 +1,22 @@
 //! Regression checks exercise real DuckDB, HTTP responses and Flight wire
 //! encoding. Fixtures contain multiple collections, sources and geometries.
 use crate::{
-    api, filter,
+    api,
+    db::{self, NeoConnection},
+    filter,
     flight::ShardFlight,
     materialize::Build,
     store::{Error, Store},
+};
+use arrow::{
+    array::StringArray,
+    datatypes::{DataType, Schema},
 };
 use arrow_flight::{
     decode::FlightRecordBatchStream, flight_service_server::FlightService, Criteria,
     FlightDescriptor, Ticket,
 };
-use duckdb::{
-    arrow::{array::StringArray, datatypes::Schema},
-    Connection,
-};
+use duckdb_neo::Parameters;
 use futures::TryStreamExt;
 use poem::{
     http::StatusCode,
@@ -26,15 +29,19 @@ use tonic::Request;
 struct Fixture {
     _dir: tempfile::TempDir,
     store: Arc<Store>,
+    catalog: String,
 }
 
 fn install_extensions() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
-        Connection::open_in_memory()
-            .unwrap()
-            .execute_batch("INSTALL spatial; INSTALL ducklake; INSTALL httpfs")
-            .unwrap()
+        let db = db::open_memory().unwrap();
+        let conn = db.connect().unwrap();
+        db::execute_all(
+            &conn,
+            &["INSTALL spatial", "INSTALL ducklake", "INSTALL httpfs"],
+        )
+        .unwrap()
     });
 }
 
@@ -54,32 +61,39 @@ impl Fixture {
         let catalog = dir.path().join("shard.ducklake");
         let files = dir.path().join("files");
         std::fs::create_dir_all(&files).unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("LOAD spatial; LOAD ducklake; LOAD httpfs;")
-            .unwrap();
-        conn.execute_batch(&format!(
-            "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}/'); USE lake;
-            CREATE TABLE features(id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON,
-              sortkey BIGINT, xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE, cx DOUBLE, cy DOUBLE, name VARCHAR);
-            INSERT INTO features VALUES
-              ('way:1', 'buildings', 1, ST_GeomFromText('POLYGON ((0 0,10 0,10 10,0 10,0 0))'), '{{\"name\":\"Café\",\"height\":12}}', 1, 0, 0, 10, 10, 5, 5, 'Café'),
-              ('way:2', 'buildings', 2, ST_Point(12,12), '{{\"name\":null}}', 2, 12, 12, 12, 12, 12, 12, NULL),
-              ('relation:1', 'buildings', 1, ST_GeomFromText('POLYGON ((-10 -10,-5 -10,-5 -5,-10 -5,-10 -10))'), '{{}}', 3, -10, -10, -5, -5, -7.5, -7.5, NULL),
-              ('way:3', 'buildings', 1, ST_Point(179,2), '{{}}', 4, 179, 2, 179, 2, 179, 2, NULL),
-              ('way:4', 'buildings', 1, ST_Point(-179,2), '{{}}', 5, -179, 2, -179, 2, -179, 2, NULL),
-              ('way:5', 'buildings', 3, ST_Point(20,60), '{{}}', 6, 20, 60, 20, 60, 20, 60, NULL),
-              ('way:road1', 'roads', 1, ST_GeomFromText('LINESTRING (0 0,20 20)'), '{{}}', 7, 0, 0, 20, 20, 10, 10, NULL);
-            CREATE TABLE collections AS SELECT DISTINCT layer AS id FROM features;
-            CALL ducklake_flush_inlined_data('lake');",
-            catalog.to_str().unwrap(),
-            files.to_str().unwrap(),
-        ))
-        .unwrap();
+        let db = db::open_memory().unwrap();
+        let conn: NeoConnection = db.connect().unwrap();
+        db::execute_all(&conn, &["LOAD spatial", "LOAD ducklake", "LOAD httpfs"]).unwrap();
+        let attach = format!(
+            "ATTACH {} AS lake (DATA_PATH {})",
+            filter::quote(&format!("ducklake:{}", catalog.to_str().unwrap())),
+            filter::quote(&format!("{}/", files.to_str().unwrap())),
+        );
+        db::execute_all(&conn, &[attach.as_str(), "USE lake"]).unwrap();
+        // One statement per execute: the v2 API takes exactly one.
+        for statement in [
+            "CREATE TABLE features(id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON,
+              sortkey BIGINT, xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE, cx DOUBLE, cy DOUBLE, name VARCHAR)",
+            "INSERT INTO features VALUES
+              ('way:1', 'buildings', 1, ST_GeomFromText('POLYGON ((0 0,10 0,10 10,0 10,0 0))'), '{\"name\":\"Café\",\"height\":12}', 1, 0, 0, 10, 10, 5, 5, 'Café'),
+              ('way:2', 'buildings', 2, ST_Point(12,12), '{\"name\":null}', 2, 12, 12, 12, 12, 12, 12, NULL),
+              ('relation:1', 'buildings', 1, ST_GeomFromText('POLYGON ((-10 -10,-5 -10,-5 -5,-10 -5,-10 -10))'), '{}', 3, -10, -10, -5, -5, -7.5, -7.5, NULL),
+              ('way:3', 'buildings', 1, ST_Point(179,2), '{}', 4, 179, 2, 179, 2, 179, 2, NULL),
+              ('way:4', 'buildings', 1, ST_Point(-179,2), '{}', 5, -179, 2, -179, 2, -179, 2, NULL),
+              ('way:5', 'buildings', 3, ST_Point(20,60), '{}', 6, 20, 60, 20, 60, 20, 60, NULL),
+              ('way:road1', 'roads', 1, ST_GeomFromText('LINESTRING (0 0,20 20)'), '{}', 7, 0, 0, 20, 20, 10, 10, NULL)",
+            "CREATE TABLE collections AS SELECT DISTINCT layer AS id FROM features",
+            "CALL ducklake_flush_inlined_data('lake')",
+        ] {
+            conn.execute(statement, Parameters::None).unwrap();
+        }
         drop(conn);
+        drop(db);
+        let catalog_path = catalog.to_str().unwrap().to_string();
         Self {
             store: Arc::new(
                 Store::open(
-                    catalog.to_str().unwrap(),
+                    &catalog_path,
                     connections,
                     8 * 1024 * 1024,
                     max_waiters,
@@ -91,14 +105,17 @@ impl Fixture {
                 )
                 .unwrap(),
             ),
+            catalog: catalog_path,
             _dir: dir,
         }
     }
 }
 
 async fn body(response: TestResponse) -> Value {
-    response.assert_status_is_ok();
-    response.0.into_body().into_json().await.unwrap()
+    let status = response.0.status();
+    let text = response.0.into_body().into_string().await.unwrap();
+    assert_eq!(status, 200, "body was: {text}");
+    serde_json::from_str(&text).unwrap()
 }
 
 #[tokio::test]
@@ -579,7 +596,7 @@ async fn flight_arrow_is_collection_scoped_and_limit_sensitive() {
         assert_eq!(schema.fields().len(), 4);
         assert_eq!(
             schema.field_with_name("geometry").unwrap().data_type(),
-            &duckdb::arrow::datatypes::DataType::Binary
+            &DataType::Binary
         );
     }
     let (_, roads) = flight_ids(
@@ -1000,7 +1017,7 @@ async fn shard_is_read_only_and_missing_files_are_not_created() {
     assert!(fixture
         .store
         .run(|conn| {
-            conn.execute("DELETE FROM features", [])?;
+            conn.execute("DELETE FROM features", Parameters::None)?;
             Ok(())
         })
         .await
@@ -1024,17 +1041,19 @@ async fn shard_is_read_only_and_missing_files_are_not_created() {
 fn tiny_parquet(dir: &tempfile::TempDir) -> std::path::PathBuf {
     install_extensions();
     let parquet = dir.path().join("source'quoted.parquet");
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&format!(
-        "LOAD spatial; COPY (
+    let db = db::open_memory().unwrap();
+    let conn = db.connect().unwrap();
+    db::execute_all(&conn, &["LOAD spatial"]).unwrap();
+    let copy = format!(
+        "COPY (
         SELECT type, id, 'Café' AS name, 12 AS height,
           ST_AsWKB(ST_MakeEnvelope(0,0,10,10)) AS geometry,
           {{'xmin':0, 'ymin':0, 'xmax':10, 'ymax':10}} AS bbox
         FROM (VALUES ('way',1),('relation',1)) t(type,id)
         ) TO {} (FORMAT PARQUET)",
         filter::quote(parquet.to_str().unwrap())
-    ))
-    .unwrap();
+    );
+    conn.execute(copy.as_str(), Parameters::None).unwrap();
     parquet
 }
 
@@ -1434,10 +1453,11 @@ async fn duck_tuning_flags_reach_duckdb_settings() {
     // Local file: external cache table exists, may be empty.
     assert_eq!(stats.ranges, 0);
 
-    // Remote tuning applies to a scratch in-memory DB (no ATTACH needed to
+    // Remote tuning applies to scratch connections (no ATTACH needed to
     // verify the SETs bind on this DuckDB version).
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("LOAD httpfs;").unwrap();
+    let db = db::open_memory().unwrap();
+    let conn = db.connect().unwrap();
+    db::execute_all(&conn, &["LOAD httpfs"]).unwrap();
     let cfg = StoreConfig {
         http_metadata_cache: true,
         parquet_metadata_cache: true,
@@ -1445,32 +1465,32 @@ async fn duck_tuning_flags_reach_duckdb_settings() {
         ..StoreConfig::default()
     };
     crate::store::apply_remote_tuning(&conn, &cfg, true).unwrap();
-    // try_clone inheritance for these keys is unreliable across builds
-    // (observed both inherited and default), so the pool tunes every
+    // Fresh sessions start from defaults, so the pool tunes every
     // connection individually.
-    let clone = conn.try_clone().unwrap();
-    crate::store::apply_remote_tuning(&clone, &cfg, true).unwrap();
-    let get_clone = |name: &str| {
-        clone
-            .query_row(
-                &format!("SELECT value FROM duckdb_settings() WHERE name='{name}'"),
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap()
+    let fresh = db.connect().unwrap();
+    crate::store::apply_remote_tuning(&fresh, &cfg, true).unwrap();
+    let get_fresh = |name: &str| {
+        db::strings_col(
+            &fresh,
+            &format!("SELECT value FROM duckdb_settings() WHERE name='{name}'"),
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
     };
     let get = |name: &str| {
-        conn.query_row(
+        db::strings_col(
+            &conn,
             &format!("SELECT value FROM duckdb_settings() WHERE name='{name}'"),
-            [],
-            |r| r.get::<_, String>(0),
         )
+        .unwrap()
+        .pop()
         .unwrap()
     };
     assert_eq!(get("enable_http_metadata_cache"), "true");
     assert_eq!(get("parquet_metadata_cache"), "true");
     assert_eq!(get("validate_external_file_cache"), "NO_VALIDATION");
-    assert_eq!(get_clone("enable_http_metadata_cache"), "true");
+    assert_eq!(get_fresh("enable_http_metadata_cache"), "true");
 }
 
 #[tokio::test]
@@ -1489,4 +1509,278 @@ async fn metrics_exposes_duck_cache_occupancy() {
     assert!(text.contains("duck_external_cache_ranges"));
     assert!(text.contains("duck_external_cache_bytes"));
     assert!(text.contains("duck_setting_enable_http_metadata_cache"));
+}
+
+// --- Quack bulk protocol -----------------------------------------------
+
+use crate::{
+    quack::QuackServer,
+    store::{catalog_url, StoreConfig},
+};
+
+fn quack_test_config() -> StoreConfig {
+    StoreConfig {
+        connections: 1,
+        cache_bytes: 1024 * 1024,
+        max_waiters: 0,
+        max_wait: std::time::Duration::ZERO,
+        bulk_limit: 1,
+        threads: 1,
+        memory_mb: 512,
+        query_timeout: std::time::Duration::ZERO,
+        ..StoreConfig::default()
+    }
+}
+
+/// A client connection with the quack extension ready. The connection
+/// keeps its database alive on its own handle.
+fn quack_client() -> NeoConnection {
+    install_extensions();
+    let db = db::open_memory().unwrap();
+    let conn = db.connect().unwrap();
+    if db::execute_all(&conn, &["LOAD quack"]).is_err() {
+        db::execute_all(&conn, &["INSTALL quack", "LOAD quack"]).unwrap();
+    }
+    // The Quack client posts over HTTP; like the server it needs httpfs
+    // loaded explicitly since autoload stays off in tests.
+    if db::execute_all(&conn, &["LOAD httpfs"]).is_err() {
+        db::execute_all(&conn, &["INSTALL httpfs", "LOAD httpfs"]).unwrap();
+    }
+    conn
+}
+
+/// Run `sql` on the Quack server at `port` authenticated as `token`.
+fn quack_query(
+    conn: &NeoConnection,
+    port: u16,
+    token: &str,
+    sql: &str,
+) -> Result<Vec<Vec<Option<String>>>, Error> {
+    let wrapped = format!(
+        "SELECT * FROM quack_query('quack:127.0.0.1:{port}', {inner}, token => {token})",
+        inner = filter::quote(sql),
+        token = filter::quote(token),
+    );
+    db::text_table(conn, &wrapped)
+}
+
+fn start_quack(fixture: &Fixture, port: u16, token: &str) -> QuackServer {
+    let cfg = quack_test_config();
+    let (server, _) = QuackServer::start(
+        &cfg,
+        false,
+        &catalog_url(&fixture.catalog),
+        fixture.store.snapshot,
+        format!("127.0.0.1:{port}").parse().unwrap(),
+        Some(token.into()),
+        false,
+    )
+    .unwrap();
+    server
+}
+
+#[tokio::test]
+async fn quack_serves_the_pinned_snapshot() {
+    let fixture = Fixture::new(1);
+    let token = "test-token-quack-1";
+    let server = start_quack(&fixture, 19521, token);
+    assert_eq!(server.uri(), "quack:127.0.0.1:19521");
+    assert_eq!(server.port(), 19521);
+    let client = quack_client();
+    let rows = quack_query(
+        &client,
+        19521,
+        token,
+        "SELECT id FROM shard.features ORDER BY id",
+    )
+    .unwrap();
+    let ids: Vec<_> = rows
+        .into_iter()
+        .map(|mut r| r.pop().flatten().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "relation:1",
+            "way:1",
+            "way:2",
+            "way:3",
+            "way:4",
+            "way:5",
+            "way:road1"
+        ]
+    );
+    server.stop().unwrap();
+}
+
+#[tokio::test]
+async fn quack_view_is_frozen_at_startup() {
+    let fixture = Fixture::new(1);
+    let token = "test-token-quack-2";
+    let server = start_quack(&fixture, 19522, token);
+    let client = quack_client();
+    let before = quack_query(
+        &client,
+        19522,
+        token,
+        "SELECT count(*)::VARCHAR FROM shard.features",
+    )
+    .unwrap();
+    // Publish a new snapshot behind the server's back: a read-write attach
+    // from this test process appends a row (new snapshot version).
+    {
+        let db = db::open_memory().unwrap();
+        let writer = db.connect().unwrap();
+        db::execute_all(&writer, &["LOAD ducklake", "LOAD spatial"]).unwrap();
+        let attach = format!(
+            "ATTACH {} AS w",
+            filter::quote(&format!("ducklake:{}", fixture.catalog))
+        );
+        db::execute_all(&writer, &[attach.as_str(), "USE w"]).unwrap();
+        writer
+            .execute(
+                "INSERT INTO features VALUES ('way:late', 'buildings', 1, ST_Point(0,0), '{}', 9, 0, 0, 0, 0, 0, 0, NULL)",
+                Parameters::None,
+            )
+            .unwrap();
+    }
+    let after = quack_query(
+        &client,
+        19522,
+        token,
+        "SELECT count(*)::VARCHAR FROM shard.features",
+    )
+    .unwrap();
+    assert_eq!(before, after, "quack must not see post-startup snapshots");
+    // The write really landed: a fresh latest-view attach sees one more row.
+    {
+        let db = db::open_memory().unwrap();
+        let fresh = db.connect().unwrap();
+        db::execute_all(&fresh, &["LOAD ducklake"]).unwrap();
+        let attach = format!(
+            "ATTACH {} AS fresh (READ_ONLY)",
+            filter::quote(&format!("ducklake:{}", fixture.catalog))
+        );
+        db::execute_all(&fresh, &[attach.as_str(), "USE fresh"]).unwrap();
+        let latest = db::int_one(&fresh, "SELECT count(*) FROM features").unwrap();
+        let pinned: i64 = before[0][0].as_deref().unwrap().parse().unwrap();
+        assert_eq!(latest, pinned + 1);
+    }
+    server.stop().unwrap();
+}
+
+#[tokio::test]
+async fn quack_rejects_bad_tokens_writes_and_control_plane() {
+    let fixture = Fixture::new(1);
+    let token = "test-token-quack-3";
+    let server = start_quack(&fixture, 19523, token);
+    let client = quack_client();
+    let denied = |sql: &str| {
+        quack_query(&client, 19523, token, sql)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| panic!("{sql} should be denied"))
+    };
+    assert!(
+        quack_query(&client, 19523, "wrong-token", "SELECT 1").is_err(),
+        "wrong token must fail authentication"
+    );
+    // Engine boundary: catalog writes are impossible on a pinned read-only attach.
+    assert!(
+        denied("INSERT INTO shard.features VALUES ('x','b',1,NULL,'{}',0,0,0,0,0,0,0,NULL)")
+            .contains("read-only")
+    );
+    // Filter boundary: everything file/control-plane shaped is denied.
+    for sql in [
+        "COPY shard.features TO '/tmp/quack-exfil.parquet'",
+        "COPY (SELECT 1 AS a) TO '/tmp/quack-exfil.parquet'",
+        "SELECT 1; COPY shard.features TO '/tmp/quack-exfil2.parquet'",
+        "/* leading comment */ COPY shard.features TO '/tmp/quack-exfil3.parquet'",
+        "SELECT count(*) FROM read_parquet('https://example.com/x.parquet')",
+        "SELECT count(*) FROM read_csv('https://example.com/x.csv')",
+        "SELECT * FROM st_read('/tmp/quack-evil.fgb')",
+        "SELECT * FROM 'https://example.com/x.parquet'",
+        "SELECT * FROM 's3://example/x.parquet'",
+        "CALL quack_serve('quack:127.0.0.1:19599')",
+        "SELECT quack_serve('quack:127.0.0.1:19599')",
+        "CALL quack_stop('quack:127.0.0.1:19523')",
+        "SET GLOBAL threads=64",
+        "RESET GLOBAL threads",
+        "SET threads=64",
+        "ATTACH 'ducklake:/tmp/other.ducklake' AS evil",
+        "DETACH shard",
+        "INSTALL excel",
+        "LOAD spatial",
+        "CREATE SECRET (TYPE s3, KEY_ID 'x', SECRET 'y')",
+    ] {
+        assert!(
+            denied(sql).contains("Authorization failed"),
+            "{sql} should be denied"
+        );
+    }
+    assert!(!std::path::Path::new("/tmp/quack-exfil.parquet").exists());
+    // Realistic bulk shapes must NOT trip the filter.
+    for sql in [
+        "SELECT id FROM shard.features ORDER BY id LIMIT 10",
+        "SELECT id, cx, cy, name FROM shard.features WHERE layer='buildings' AND source_id IN (1) ORDER BY id LIMIT 100 OFFSET 10",
+        "SELECT count(*)::VARCHAR FROM shard.features",
+        "SELECT layer, count(*)::VARCHAR FROM shard.features GROUP BY layer ORDER BY 1",
+        "WITH city AS (SELECT id FROM shard.features WHERE source_id IN (1,2)) SELECT count(*)::VARCHAR FROM city",
+        "SELECT id FROM shard.features WHERE name ILIKE '%Copy Shop%' ORDER BY id",
+        "SELECT id FROM shard.features WHERE name = 'Load Street' ORDER BY id",
+        "SELECT id, properties->>'name' AS n FROM shard.features ORDER BY id LIMIT 5",
+        "SELECT id FROM shard.features WHERE ST_Intersects(geom, ST_MakeEnvelope(0,0,10,10)) ORDER BY id",
+        "SELECT 'a' AS a; SELECT 'b' AS b",
+        "EXPLAIN SELECT id FROM shard.features ORDER BY id LIMIT 1",
+    ] {
+        quack_query(&client, 19523, token, sql)
+            .unwrap_or_else(|e| panic!("legit shape denied: {sql}: {e}"));
+    }
+    server.stop().unwrap();
+}
+
+#[tokio::test]
+async fn quack_refuses_non_local_bind_without_opt_in() {
+    let fixture = Fixture::new(1);
+    let cfg = quack_test_config();
+    assert!(QuackServer::start(
+        &cfg,
+        false,
+        &catalog_url(&fixture.catalog),
+        fixture.store.snapshot,
+        "0.0.0.0:19524".parse().unwrap(),
+        Some("test-token-quack-4".into()),
+        false,
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn quack_attached_catalog_serves_sql() {
+    // A real DuckDB client attaching over the protocol (not just
+    // quack_query): verifies the handshake needs nothing the guard denies.
+    let fixture = Fixture::new(1);
+    let token = "test-token-quack-5";
+    let server = start_quack(&fixture, 19525, token);
+    let client = quack_client();
+    // Token via secret, as documented for clients: secret first, the
+    // ATTACH itself already authenticates.
+    let secret = format!("CREATE SECRET (TYPE quack, TOKEN {})", filter::quote(token));
+    db::execute_all(&client, &[secret.as_str()]).unwrap();
+    let attach = format!("ATTACH {} AS r", filter::quote("quack:127.0.0.1:19525"));
+    db::execute_all(&client, &[attach.as_str()]).unwrap();
+    let ids = db::strings_col(&client, "SELECT id FROM r.shard.main.features ORDER BY id").unwrap();
+    assert_eq!(
+        ids,
+        [
+            "relation:1",
+            "way:1",
+            "way:2",
+            "way:3",
+            "way:4",
+            "way:5",
+            "way:road1"
+        ]
+    );
+    server.stop().unwrap();
 }

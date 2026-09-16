@@ -1,8 +1,10 @@
 mod api;
+mod db;
 mod filter;
 mod flight;
 mod materialize;
 mod plan;
+mod quack;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -78,6 +80,21 @@ enum Command {
         /// for remote immutable shards). Only set for mutable URLs.
         #[arg(long)]
         enable_cache_validation: bool,
+        /// Quack bulk-protocol listen address. On by default; serves the
+        /// same pinned snapshot through a locked-down read-only view.
+        #[arg(long, default_value = "127.0.0.1:9494")]
+        quack_listen: SocketAddr,
+        /// Disable the Quack listener.
+        #[arg(long)]
+        no_quack: bool,
+        /// Quack authentication token. Generated randomly per process when
+        /// unset and printed once at startup; never logged again.
+        #[arg(long, env = "IRON_FEATHER_QUACK_TOKEN")]
+        quack_token: Option<String>,
+        /// Allow Quack to bind a non-localhost address (still token-gated;
+        /// front with a TLS-terminating proxy).
+        #[arg(long)]
+        allow_remote_quack: bool,
     },
 }
 
@@ -107,13 +124,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             disable_http_metadata_cache,
             disable_parquet_metadata_cache,
             enable_cache_validation,
+            quack_listen,
+            no_quack,
+            quack_token,
+            allow_remote_quack,
         } => {
             let bulk_limit = if flight_concurrency == 0 {
                 connections.into()
             } else {
                 flight_concurrency.into()
             };
-            let store = Arc::new(store::Store::open_config(store::StoreConfig {
+            let config = store::StoreConfig {
                 location: shard.clone(),
                 connections: connections.into(),
                 cache_bytes: u64::from(cache_mb) * 1024 * 1024,
@@ -128,8 +149,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 http_metadata_cache: !disable_http_metadata_cache,
                 parquet_metadata_cache: !disable_parquet_metadata_cache,
                 no_validation: !enable_cache_validation,
-            })?);
-            tracing::info!(%listen, %flight_listen, %shard, "serving shard");
+            };
+            let store = Arc::new(store::Store::open_config(config.clone())?);
+            tracing::info!(%listen, %flight_listen, %shard, snapshot = store.snapshot, "serving shard");
+            // Bulk protocol over the same pinned snapshot, locked down (see
+            // quack.rs). The token prints once here and never again.
+            let quack = if no_quack {
+                None
+            } else {
+                let remote = ["http://", "https://", "s3://"]
+                    .iter()
+                    .any(|scheme| shard.starts_with(scheme));
+                let (server, token) = quack::QuackServer::start(
+                    &config,
+                    remote,
+                    &store::catalog_url(&shard),
+                    store.snapshot,
+                    quack_listen,
+                    quack_token,
+                    allow_remote_quack,
+                )?;
+                tracing::info!(
+                    uri = server.uri(),
+                    port = server.port(),
+                    "quack serving pinned snapshot"
+                );
+                // Print once: operators copy this into client secrets.
+                println!("quack_token={token}");
+                Some(server)
+            };
             let http = poem::Server::new(poem::listener::TcpListener::bind(listen))
                 .run(api::routes(store.clone()));
             let flight = tonic::transport::Server::builder()
@@ -140,10 +188,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .serve(flight_listen);
             // A bind/runtime failure in either listener terminates the service.
+            // Ctrl-C stops the Quack listener politely, then the process
+            // exits (dropping the HTTP/Flight servers with it).
             tokio::select! {
                 result = http => result?,
                 result = flight => result?,
-                result = tokio::signal::ctrl_c() => result?,
+                result = tokio::signal::ctrl_c() => {
+                    result?;
+                    if let Some(quack) = &quack {
+                        quack.stop()?;
+                    }
+                }
             }
         }
     }

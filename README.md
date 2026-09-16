@@ -8,10 +8,12 @@ OSM Layercake GeoParquet (HTTPS)
                           └─ shared read-only connection pool
                                ├─ OGC Features / XYZ tiles → cached response bytes
                                └─ Arrow Flight → native DuckDB Arrow batches (uncached)
+                          └─ Quack bulk listener → pinned read-only snapshot
 ```
 
 One binary, two commands, one snapshot. Apache-2.0. DuckDB 2.0 nightly
-(`v2.0.0-alpha42069`; see `scripts/duckdb_version.py` for the exact pin).
+(`v2.0.0-alpha42069`; see `scripts/duckdb_version.py` for the exact pin),
+accessed exclusively through the stable v2 C API.
 
 One binary, two commands, one shard. Apache-2.0.
 
@@ -160,6 +162,41 @@ DuckDB produces native Arrow batches, which are encoded directly for Flight with
 
 ```sh
 cargo run --locked --example flight_client
+```
+
+## Quack bulk protocol
+
+`serve` also listens for [Quack](https://duckdb.org/docs/current/quack/overview)
+(`--quack-listen`, default `127.0.0.1:9494`; `--no-quack` disables it): raw
+SQL over HTTP for DuckDB-native bulk consumers, served from a **separate
+database** so bulk scans never evict the OGC/Flight working set.
+
+The view is narrowed, not full access:
+
+- **Pinned snapshot.** The Quack instance attaches the exact snapshot the
+  server resolved at startup (`SNAPSHOT_VERSION`); later publishes stay
+  invisible, and the engine rejects writes on pinned attaches.
+- **Read-only.** Catalog writes fail engine-side.
+- **Token auth.** `--quack-token` / `IRON_FEATHER_QUACK_TOKEN`, else a random
+  per-process token printed once at startup and never logged.
+- **Localhost bind** unless `--allow-remote-quack` is passed (front remote
+  exposure with a TLS-terminating proxy, per upstream guidance).
+- **Statement filter.** A guard macro denies control plane
+  (`quack_serve`/`quack_stop`), server-global settings, catalog topology
+  (`ATTACH`/`DETACH`), file I/O (`COPY`, `read_*`, `st_read`, direct-URL
+  `FROM`), extension loading, and secret creation.
+
+Treat the token as privileged: anything else a holder runs is equivalent to
+a local DuckDB shell. Clients address `shard.<table>`:
+
+```sql
+-- Any DuckDB with the quack extension (CLI shown).
+CREATE SECRET (TYPE quack, TOKEN '<token>');
+ATTACH 'quack:127.0.0.1:9494' AS r;
+SELECT count(*) FROM r.shard.main.features;
+-- Or stateless per query (no ATTACH needed):
+SELECT * FROM quack_query('quack:127.0.0.1:9494',
+  'SELECT id FROM shard.features ORDER BY id LIMIT 10', token => '<token>');
 ```
 
 ## Performance and verification

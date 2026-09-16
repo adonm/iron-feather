@@ -1,6 +1,7 @@
 //! OGC API Features Core / GeoJSON / OpenAPI 3.0 over the shared shard.
 
 use crate::{
+    db::NeoConnection,
     filter,
     plan::{self, ItemsRequest, Pagination},
     store::{CachedBody, Error, QueryFn, Store},
@@ -442,21 +443,18 @@ fn feature(
     })
 }
 
-fn fetch_rows(
-    conn: &duckdb::Connection,
-    sql: &str,
-) -> Result<Vec<(String, String, String)>, Error> {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, Option<String>>(1)?
-                .unwrap_or_else(|| "null".into()),
-            r.get::<_, Option<String>>(2)?
-                .unwrap_or_else(|| "null".into()),
-        ))
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Error::from)
+fn fetch_rows(conn: &NeoConnection, sql: &str) -> Result<Vec<(String, String, String)>, Error> {
+    Ok(crate::db::text_table(conn, sql)?
+        .into_iter()
+        .map(|mut row| {
+            let mut cells = row.drain(..).map(|c| c.unwrap_or_else(|| "null".into()));
+            (
+                cells.next().unwrap_or_else(|| "null".into()),
+                cells.next().unwrap_or_else(|| "null".into()),
+                cells.next().unwrap_or_else(|| "null".into()),
+            )
+        })
+        .collect())
 }
 
 fn rows_to_features(
@@ -521,7 +519,7 @@ async fn items(
     // A cursor bounds the id range, so DuckDB starts at the page instead of
     // discarding `offset` leading rows. Offset stays for direct links.
     let limit = query.limit;
-    let query: QueryFn = Box::new(move |conn: &duckdb::Connection| {
+    let query: QueryFn = Box::new(move |conn: &NeoConnection| {
         let selected = std::time::Instant::now();
         let req_owned = normalized.clone();
         let pagination = req_owned.pagination.clone();
@@ -608,30 +606,31 @@ async fn item(
     // Key and SQL both derive from the normalized inputs; SQL builds on
     // miss so hits pay validation + lookup only.
     let key = plan::item_key(&collection, &id, &sources);
-    let query: QueryFn = Box::new(move |conn: &duckdb::Connection| {
+    let query: QueryFn = Box::new(move |conn: &NeoConnection| {
         let sql = format!(
-            "SELECT {FEATURE_COLUMNS}, layer, source_id FROM features WHERE id = {} LIMIT 1",
+            "SELECT {FEATURE_COLUMNS}, layer, source_id::VARCHAR FROM features WHERE id = {} LIMIT 1",
             filter::quote(&id)
         );
-        let (raw_id, geometry, properties, actual_collection, source_id): (
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            i64,
-        ) = match conn.query_row(&sql, [], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        }) {
-            Ok(row) => row,
-            Err(duckdb::Error::QueryReturnedNoRows) => return Err(Error::NotFound(id)),
-            Err(error) => return Err(error.into()),
+        let mut rows = crate::db::text_table(conn, &sql)?;
+        let mut row = match rows.pop() {
+            Some(row) => row,
+            None => return Err(Error::NotFound(id)),
         };
+        let mut cells = row.drain(..);
+        let (raw_id, geometry, properties, actual_collection, source_id) = (
+            cells
+                .next()
+                .flatten()
+                .ok_or_else(|| Error::NotFound(id.clone()))?,
+            cells.next().flatten(),
+            cells.next().flatten(),
+            cells.next().flatten().unwrap_or_default(),
+            cells
+                .next()
+                .flatten()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(-1),
+        );
         if actual_collection != collection || !sources.contains(&source_id) {
             return Err(Error::NotFound(id));
         }

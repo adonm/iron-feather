@@ -1,12 +1,18 @@
-//! One immutable shard, one bounded-queue pool, one byte-bounded response cache.
+//! One immutable snapshot, one bounded-queue pool, one byte-bounded response cache.
 //! Moka owns caching and cancellation-safe request coalescing for HTTP.
+//!
+//! All DuckDB access goes through the stable v2 C API, see [`crate::db`].
 
-use crate::filter;
-use bytes::Bytes;
-use duckdb::{
-    arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
-    Config, Connection,
+use crate::{
+    db::{self, NeoConnection},
+    filter,
 };
+use arrow::{
+    datatypes::SchemaRef,
+    record_batch::{RecordBatch, RecordBatchReader},
+};
+use bytes::Bytes;
+use duckdb_neo::Parameters;
 use moka::future::Cache;
 use std::{
     io::Write,
@@ -29,11 +35,6 @@ pub enum Error {
     Backend(String),
 }
 
-impl From<duckdb::Error> for Error {
-    fn from(e: duckdb::Error) -> Self {
-        Self::Backend(e.to_string())
-    }
-}
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Self::Backend(e.to_string())
@@ -142,13 +143,26 @@ pub struct FlightBatches {
     pub global_buffered: Arc<AtomicUsize>,
 }
 
-/// Shared lifecycle for one DuckDB query. The worker sets the interrupt
+/// Raw v2 connection handle: a pointer, always safe to interrupt from any
+/// thread while another thread steps the query's result.
+///
+/// The handle is `Send`/`Sync` by the engine's contract (`duckdb_v2_connection_interrupt`
+/// documents cross-thread use); it is only ever dereferenced for interrupt,
+/// never for query execution.
+#[derive(Clone, Copy)]
+struct RawHandle(libduckdb_sys::v2::duckdb_v2_connection_handle);
+// Safe: interrupt is documented safe from any thread, including while
+// another thread steps the query's result; a no-op when idle.
+unsafe impl Send for RawHandle {}
+unsafe impl Sync for RawHandle {}
+
+/// Shared lifecycle for one DuckDB query. The worker records the connection
 /// handle on start and clears it on completion before the connection goes
 /// back to the pool; guards and timeout tasks only interrupt while a handle
 /// is present, so a late drop cannot cancel the next query on that
 /// connection.
 pub struct QueryState {
-    interrupt: Mutex<Option<Arc<duckdb::InterruptHandle>>>,
+    interrupt: Mutex<Option<RawHandle>>,
     cancelled: AtomicBool,
     completed: AtomicBool,
 }
@@ -162,8 +176,8 @@ impl QueryState {
         }
     }
 
-    fn set_interrupt(&self, handle: Arc<duckdb::InterruptHandle>) {
-        *self.interrupt.lock().unwrap() = Some(handle);
+    fn set_interrupt(&self, conn: &NeoConnection) {
+        *self.interrupt.lock().unwrap() = Some(RawHandle(**conn));
     }
 
     fn finish(&self) {
@@ -173,8 +187,10 @@ impl QueryState {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-        if let Some(handle) = self.interrupt.lock().unwrap().as_ref().cloned() {
-            handle.interrupt();
+        if let Some(handle) = *self.interrupt.lock().unwrap() {
+            // Safe: the handle is cleared before its connection returns to
+            // the pool, and interrupt is a no-op on idle connections.
+            unsafe { db::interrupt_handle(handle.0) };
         }
     }
 
@@ -282,7 +298,7 @@ fn reserve_flight_budget(
 
 /// A response query deferred past content negotiation: encoding-first
 /// lookup needs the key before deciding whether to run the database work.
-pub type QueryFn = Box<dyn FnOnce(&Connection) -> Result<Bytes, Error> + Send + 'static>;
+pub type QueryFn = Box<dyn FnOnce(&NeoConnection) -> Result<Bytes, Error> + Send + 'static>;
 
 /// Bulk versus interactive admission. Bulk holds a bulk semaphore slot for
 /// its whole execution so heavy scans and Flight cannot starve small pages;
@@ -326,7 +342,10 @@ pub struct CacheSnapshot {
 
 pub struct Store {
     pub collections: Vec<String>,
-    pool: Arc<Mutex<Vec<Connection>>>,
+    /// Pinned DuckLake snapshot this instance serves. Resolved at startup;
+    /// both the serving pool and Quack attach at exactly this version.
+    pub snapshot: i64,
+    pool: Arc<Mutex<Vec<NeoConnection>>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     /// Present only when bulk is capped below the pool size; `None` leaves
     /// bulk sharing the pool queue exactly like interactive traffic.
@@ -373,8 +392,8 @@ impl CachedBody {
 // permit is held alongside the connection, so one waiter advances per return
 // in FIFO order.
 struct Checkout {
-    conn: Option<Connection>,
-    pool: Arc<Mutex<Vec<Connection>>>,
+    conn: Option<NeoConnection>,
+    pool: Arc<Mutex<Vec<NeoConnection>>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 impl Drop for Checkout {
@@ -405,11 +424,42 @@ fn manifest_path_for(location: &str) -> Option<String> {
     Some(format!("{location}.manifest.json"))
 }
 
+/// Attach path for a catalog location. Shared by the serving pool and the
+/// Quack instance so both pin the same snapshot.
+pub fn catalog_url(location: &str) -> String {
+    format!("ducklake:{}", location.trim_end_matches('/'))
+}
+
+/// Full per-connection setup: extensions, remote tuning, then the catalog
+/// attach pinned to `snapshot` (`None` resolves it first). Every pooled
+/// connection runs the session part; the ATTACH itself is database-level
+/// and done once (see [`Store::open_config`]).
+fn setup_session(conn: &NeoConnection, cfg: &StoreConfig, remote: bool) -> Result<(), Error> {
+    // Extensions load first; ducklake installs on demand once, then loads
+    // offline like spatial does.
+    if db::execute_all(conn, &["LOAD ducklake"]).is_err() {
+        db::execute_all(conn, &["INSTALL ducklake", "LOAD ducklake"])?;
+    }
+    db::execute_all(
+        conn,
+        &[
+            "SET autoinstall_known_extensions=false",
+            "SET autoload_known_extensions=false",
+            "LOAD spatial",
+            "LOAD httpfs",
+        ],
+    )?;
+    // Remote storage tuning before ATTACH so the catalog open and all
+    // later reads use it. Local shards skip this entirely.
+    apply_remote_tuning(conn, cfg, remote)?;
+    Ok(())
+}
+
 /// DuckDB storage-layer tuning for remote shards. Built-in caches first:
 /// HTTP metadata, Parquet metadata, and (for immutable versioned URLs)
 /// NO_VALIDATION skip revalidation on warm buffers.
 pub(crate) fn apply_remote_tuning(
-    conn: &Connection,
+    conn: &NeoConnection,
     cfg: &StoreConfig,
     remote: bool,
 ) -> Result<(), Error> {
@@ -418,22 +468,20 @@ pub(crate) fn apply_remote_tuning(
     }
     // httpfs-owned settings fail when the extension isn't loaded (autoload
     // is off), so load it before any SET. Installed in all serve images.
-    conn.execute_batch("LOAD httpfs;")?;
-    conn.execute_batch("SET enable_external_file_cache=true;")?;
-    conn.execute_batch(&format!(
-        "SET enable_http_metadata_cache={};",
-        cfg.http_metadata_cache
-    ))?;
-    conn.execute_batch(&format!(
-        "SET parquet_metadata_cache={};",
-        cfg.parquet_metadata_cache
-    ))?;
-    if cfg.no_validation {
-        conn.execute_batch("SET validate_external_file_cache='NO_VALIDATION';")?;
-    } else {
-        conn.execute_batch("SET validate_external_file_cache='VALIDATE_ALL';")?;
-    }
-    Ok(())
+    db::execute_all(
+        conn,
+        &[
+            "LOAD httpfs",
+            "SET enable_external_file_cache=true",
+            &format!("SET enable_http_metadata_cache={}", cfg.http_metadata_cache),
+            &format!("SET parquet_metadata_cache={}", cfg.parquet_metadata_cache),
+            if cfg.no_validation {
+                "SET validate_external_file_cache='NO_VALIDATION'"
+            } else {
+                "SET validate_external_file_cache='VALIDATE_ALL'"
+            },
+        ],
+    )
 }
 
 impl Store {
@@ -485,50 +533,71 @@ impl Store {
         let remote = ["http://", "https://", "s3://"]
             .iter()
             .any(|scheme| cfg.location.starts_with(scheme));
-        let mut config = Config::default().threads(cfg.threads)?;
-        if cfg.memory_mb > 0 {
-            config = config.max_memory(&format!("{}MiB", cfg.memory_mb))?;
-        }
-        let conn = Connection::open_in_memory_with_flags(config)?;
-        // Extensions load first; ducklake installs on demand once, then
-        // loads offline like spatial does.
-        if conn.execute_batch("LOAD ducklake;").is_err() {
-            conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
-        }
-        conn.execute_batch(
-            "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; LOAD spatial;",
+        let db = db::open_memory()?;
+        // Process-wide budgets, set once on the shared database.
+        let threads = duckdb_neo::connection_options::ConfigOptionValue::new(
+            "threads",
+            &cfg.threads.to_string(),
         )?;
-        // Remote storage tuning before ATTACH so the catalog open and all
-        // later reads use it. Local shards skip this entirely.
-        apply_remote_tuning(&conn, &cfg, remote)?;
-        conn.execute_batch(&format!(
-            "LOAD httpfs; ATTACH {} AS shard (READ_ONLY); USE shard;",
-            crate::filter::quote(&format!("ducklake:{}", cfg.location.trim_end_matches('/')))
-        ))?;
-        // Re-assert after ATTACH: loading httpfs for the attach can reset
-        // session-level flags on some builds; idempotent and cheap.
-        apply_remote_tuning(&conn, &cfg, remote)?;
-        // DuckLake resolves Parquet data files at query time through regular
-        // file access, which an external-access lockdown would deny; all SQL
-        // here is server-generated.
-        let _ = conn
-            .prepare(
-                "SELECT id, layer, source_id, ST_AsWKB(geom), properties::JSON FROM features LIMIT 0",
-            )?
-            .query([])?;
+        db.set_option(&threads)?;
+        if cfg.memory_mb > 0 {
+            let memory = duckdb_neo::connection_options::ConfigOptionValue::new(
+                "memory_limit",
+                &format!("{}MiB", cfg.memory_mb),
+            )?;
+            db.set_option(&memory)?;
+        }
+        let catalog = catalog_url(&cfg.location);
+        // Open one connection per pool slot. The ATTACH is database-level:
+        // the opener attaches latest to resolve the snapshot, then detaches
+        // and re-attaches pinned; every connection only switches into it.
+        // Sessions do not inherit storage SETs, so each runs full setup.
+        let opener = db.connect()?;
+        setup_session(&opener, &cfg, remote)?;
+        db::execute_all(
+            &opener,
+            &[
+                &format!(
+                    "ATTACH {} AS shard (READ_ONLY)",
+                    crate::filter::quote(&catalog)
+                ),
+                "USE shard",
+            ],
+        )?;
+        let snapshot = db::int_one(&opener, "SELECT max(snapshot_id) FROM snapshots()")?;
+        // Frozen view: even a swapped catalog file cannot move the reader.
+        // Writes are rejected on pinned attaches by the engine itself.
+        db::execute_all(
+            &opener,
+            &[
+                "USE memory",
+                "DETACH shard",
+                &format!(
+                    "ATTACH {} AS shard (READ_ONLY, SNAPSHOT_VERSION {})",
+                    crate::filter::quote(&catalog),
+                    snapshot
+                ),
+                "USE shard",
+            ],
+        )?;
+        apply_remote_tuning(&opener, &cfg, remote)?;
+        let mut pool = Vec::with_capacity(cfg.connections);
+        for _ in 0..cfg.connections {
+            let conn = db.connect()?;
+            setup_session(&conn, &cfg, remote)?;
+            db::execute_all(&conn, &["USE shard"])?;
+            apply_remote_tuning(&conn, &cfg, remote)?;
+            pool.push(conn);
+        }
+        drop(opener);
+        let probe = pool.first().ok_or(Error::Overloaded)?;
         // Build-time derivatives (cx/cy/name) are required: the builder
         // always writes them so Flight and tiles avoid per-row geometry/JSON
         // work.
-        conn.prepare("SELECT cx, cy, name FROM features LIMIT 0")?
-            .query([])
-            .map(|_| ())
-            .map_err(|_| {
-                Error::Invalid("shard is missing derived cx/cy/name columns; rebuild".into())
-            })?;
-        let collections = conn
-            .prepare("SELECT id FROM collections ORDER BY id")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        db::text_table(probe, "SELECT cx, cy, name FROM features LIMIT 0").map_err(|_| {
+            Error::Invalid("shard is missing derived cx/cy/name columns; rebuild".into())
+        })?;
+        let collections = db::strings_col(probe, "SELECT id FROM collections ORDER BY id")?;
         if collections
             .iter()
             .any(|id| !crate::filter::collection_id(id))
@@ -540,26 +609,9 @@ impl Store {
         let manifest = manifest_path_for(&cfg.location)
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| serde_json::from_str::<ShardManifest>(&text).ok());
-        // Pool connections do NOT inherit httpfs/storage SETs from the
-        // opener (verified: try_clone starts from defaults for these
-        // keys), so every connection gets the full tuning. The catalog
-        // ATTACH itself lives on the shared DB and is done once above;
-        // clones only switch into it.
-        let mut pool = Vec::with_capacity(cfg.connections);
-        for _ in 1..cfg.connections {
-            let clone = conn.try_clone()?;
-            apply_remote_tuning(&clone, &cfg, remote)?;
-            clone.execute_batch("USE shard;")?;
-            pool.push(clone);
-        }
-        // Re-assert on the opener too (its ATTACH-time LOAD may have reset
-        // per-connection flags after the earlier apply).
-        apply_remote_tuning(&conn, &cfg, remote)?;
-        // Opener already USEd shard at ATTACH; harmless to re-assert.
-        let _ = conn.execute_batch("USE shard;");
-        pool.push(conn);
         Ok(Self {
             collections,
+            snapshot,
             pool: Arc::new(Mutex::new(pool)),
             semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.connections)),
             bulk,
@@ -604,16 +656,21 @@ impl Store {
     /// unavailable (e.g. local-only tests). Never fails `/metrics`.
     pub async fn duck_cache_stats(&self) -> DuckCacheStats {
         self.run(|conn| {
-            let (ranges, bytes): (i64, Option<i64>) = conn
-                .query_row(
-                    "SELECT count(*), sum(nr_bytes) FROM duckdb_external_file_cache()",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(|_| Error::Overloaded)?;
+            let rows = db::int_table(
+                conn,
+                "SELECT count(*)::BIGINT, coalesce(sum(nr_bytes), 0)::BIGINT FROM duckdb_external_file_cache()",
+            )
+            .map_err(|_| Error::Overloaded)?;
+            let (ranges, bytes) = match rows.first() {
+                Some(row) => (
+                    row[0].unwrap_or(0),
+                    row[1].unwrap_or(0),
+                ),
+                None => (0, 0),
+            };
             Ok(DuckCacheStats {
                 ranges: ranges.max(0) as u64,
-                bytes: bytes.unwrap_or(0).max(0) as u64,
+                bytes: bytes.max(0) as u64,
             })
         })
         .await
@@ -635,12 +692,15 @@ impl Store {
                 "threads",
                 "memory_limit",
             ] {
-                let value: Result<String, _> = conn.query_row(
+                let rows = db::text_table(
+                    conn,
                     &format!("SELECT value FROM duckdb_settings() WHERE name='{key}'"),
-                    [],
-                    |r| r.get(0),
-                );
-                if let Ok(value) = value {
+                )?;
+                if let Some(value) = rows
+                    .into_iter()
+                    .next()
+                    .and_then(|mut row| row.pop().flatten())
+                {
                     out.push((key.to_string(), value));
                 }
             }
@@ -721,7 +781,7 @@ impl Store {
     pub async fn run<T, F>(&self, query: F) -> Result<T, Error>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T, Error> + Send + 'static,
+        F: FnOnce(&NeoConnection) -> Result<T, Error> + Send + 'static,
     {
         self.run_class(WorkClass::Interactive, query).await
     }
@@ -730,7 +790,7 @@ impl Store {
     pub async fn run_bulk<T, F>(&self, query: F) -> Result<T, Error>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T, Error> + Send + 'static,
+        F: FnOnce(&NeoConnection) -> Result<T, Error> + Send + 'static,
     {
         self.run_class(WorkClass::Bulk, query).await
     }
@@ -738,7 +798,7 @@ impl Store {
     async fn run_class<T, F>(&self, class: WorkClass, query: F) -> Result<T, Error>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T, Error> + Send + 'static,
+        F: FnOnce(&NeoConnection) -> Result<T, Error> + Send + 'static,
     {
         let bulk = match class {
             WorkClass::Bulk => self.acquire_bulk()?,
@@ -748,7 +808,7 @@ impl Store {
         // so each return advances exactly one waiter.
         let checkout = self.checkout().await?;
         let state = Arc::new(QueryState::new());
-        state.set_interrupt(checkout.conn.as_ref().unwrap().interrupt_handle());
+        state.set_interrupt(checkout.conn.as_ref().unwrap());
         let timeout = self.timeout_task(state.clone());
         let guard = RunGuard {
             state: state.clone(),
@@ -834,7 +894,7 @@ impl Store {
     /// Heavy pages share the bulk lane with Flight.
     pub async fn bytes<F>(&self, key: String, heavy: bool, query: F) -> Result<CachedBody, Error>
     where
-        F: FnOnce(&Connection) -> Result<Bytes, Error> + Send + 'static,
+        F: FnOnce(&NeoConnection) -> Result<Bytes, Error> + Send + 'static,
     {
         let class = if heavy {
             WorkClass::Bulk
@@ -852,7 +912,7 @@ impl Store {
     #[allow(dead_code)]
     pub async fn bytes_interactive<F>(&self, key: String, query: F) -> Result<CachedBody, Error>
     where
-        F: FnOnce(&Connection) -> Result<Bytes, Error> + Send + 'static,
+        F: FnOnce(&NeoConnection) -> Result<Bytes, Error> + Send + 'static,
     {
         self.bytes(key, false, query).await
     }
@@ -891,12 +951,14 @@ impl Store {
                 "SELECT {projection} FROM (SELECT id, geom, properties, source_id, cx, cy, name FROM features \
                  WHERE {predicate} ORDER BY id LIMIT {limit} OFFSET {offset}) AS page ORDER BY page.id"
             );
-            let mut stmt = conn.prepare(&sql)?;
-            let result = stmt.stream_arrow([])?;
-            Ok(ArrowResult {
-                schema: result.get_schema(),
-                batches: result.collect(),
-            })
+            let mut result = conn.query(sql.as_str(), Parameters::None)?;
+            let reader = db::arrow_stream(&mut result)?;
+            let schema = reader.schema();
+            let mut batches = Vec::new();
+            for batch in reader {
+                batches.push(batch.map_err(|e| Error::Backend(e.to_string()))?);
+            }
+            Ok(ArrowResult { schema, batches })
         })
         .await
     }
@@ -908,7 +970,7 @@ impl Store {
         let bulk = self.acquire_bulk()?;
         let checkout = self.checkout().await?;
         let state = Arc::new(QueryState::new());
-        state.set_interrupt(checkout.conn.as_ref().unwrap().interrupt_handle());
+        state.set_interrupt(checkout.conn.as_ref().unwrap());
         let timeout = self.timeout_task(state.clone());
         let (schema_tx, schema_rx) = tokio::sync::oneshot::channel::<Result<SchemaRef, Error>>();
         // Count-based bound is a backstop; the byte budgets do the real work.
@@ -923,44 +985,39 @@ impl Store {
             let _checkout = checkout;
             let _bulk = bulk;
             let conn = _checkout.conn.as_ref().unwrap();
-            let mut stmt = match conn.prepare(&sql) {
-                Ok(stmt) => stmt,
+            let mut result = match conn.query(sql.as_str(), Parameters::None) {
+                Ok(result) => result,
                 Err(e) => {
                     let _ = schema_tx.send(Err(e.into()));
                     state_worker.finish();
                     return;
                 }
             };
-            let stream = match stmt.stream_arrow([]) {
-                Ok(stream) => stream,
+            let reader = match db::arrow_stream(&mut result) {
+                Ok(reader) => reader,
                 Err(e) => {
-                    let _ = schema_tx.send(Err(e.into()));
+                    let _ = schema_tx.send(Err(e));
                     state_worker.finish();
                     return;
                 }
             };
-            let schema = stream.get_schema();
+            let schema = reader.schema();
             if schema_tx.send(Ok(schema)).is_err() {
                 state_worker.finish();
                 return;
             }
-            // Advance the iterator inside the panic boundary: DuckDB fetch
-            // failures panic instead of returning Err.
-            let mut stream = stream;
-            loop {
+            for batch in reader {
                 if state_worker.is_cancelled() || batch_tx.is_closed() {
                     break;
                 }
-                let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stream.next()));
-                let batch = match next {
+                let batch = match batch {
                     Err(_) => {
                         let _ = batch_tx.blocking_send(Err(Error::Backend(
                             "shard streaming query failed".into(),
                         )));
                         break;
                     }
-                    Ok(None) => break,
-                    Ok(Some(batch)) => batch,
+                    Ok(batch) => batch,
                 };
                 let size = batch.get_array_memory_size();
                 if !reserve_flight_budget(

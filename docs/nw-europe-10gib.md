@@ -8,7 +8,9 @@
 > layout directly (`--sort grid|hilbert|none --file-mb N --row-group N`).
 > The `--duck-disk-cache-dir` experiment below is also gone (`cache_httpfs`
 > has no 2.0 build); current tuning is HTTP/Parquet metadata caches plus
-> `NO_VALIDATION`. Re-run the matrix on the nightly before quoting ratios.
+> `NO_VALIDATION`. All DuckDB access since runs through the stable v2 C API,
+> and Quack serves the pinned snapshot as the bulk protocol (see README).
+> Re-run the matrix on the nightly before quoting ratios.
 
 Question: what does serving a ~10 GB shard look like, and does heap layout
 matter for direct S3 attachment? All runs below are loopback (no real S3

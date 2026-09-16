@@ -1,9 +1,9 @@
 //! Remote I/O happens here, once: Layercake GeoParquet becomes a versioned
 //! DuckLake snapshot (small catalog plus spatially clustered Parquet) ready
 //! to serve straight from S3.
-use crate::{filter, store::ShardManifest};
+use crate::{db, filter, store::ShardManifest};
 use clap::Args;
-use duckdb::Connection;
+use duckdb_neo::Parameters;
 use std::path::{Path, PathBuf};
 
 #[derive(Args, Debug)]
@@ -135,20 +135,31 @@ impl Build {
         staging_data: &Path,
         data_url: &str,
     ) -> Result<i64, Box<dyn std::error::Error>> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch("INSTALL spatial; LOAD spatial;")?;
-        conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
+        let db = db::open_memory()?;
+        let conn = db.connect()?;
+        conn.execute("INSTALL spatial", Parameters::None)?;
+        conn.execute("LOAD spatial", Parameters::None)?;
+        conn.execute("INSTALL ducklake", Parameters::None)?;
+        conn.execute("LOAD ducklake", Parameters::None)?;
         if self.from.starts_with("https://")
             || self.from.starts_with("http://")
             || self.from.starts_with("s3://")
         {
-            conn.execute_batch("INSTALL httpfs; LOAD httpfs;")?;
+            conn.execute("INSTALL httpfs", Parameters::None)?;
+            conn.execute("LOAD httpfs", Parameters::None)?;
         }
         let input = format!("read_parquet({})", filter::quote(&self.from));
-        let columns = conn
-            .prepare(&format!("DESCRIBE SELECT * FROM {input}"))?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let columns: Vec<(String, String)> =
+            db::text_table(&conn, &format!("DESCRIBE SELECT * FROM {input}"))?
+                .into_iter()
+                .map(|mut row| {
+                    let mut cells = row.drain(..);
+                    (
+                        cells.next().flatten().unwrap_or_default(),
+                        cells.next().flatten().unwrap_or_default(),
+                    )
+                })
+                .collect();
         let geom_type = columns
             .iter()
             .find(|(name, _)| name == "geometry")
@@ -178,9 +189,9 @@ impl Build {
         // Clustering for tight per-file bbox statistics: grid cells from the
         // region origin keep nearby rows in the same files; Hilbert is the
         // alternative when the source order is already scattered.
-        let (sort_ddl, sort_select) = match self.sort.as_str() {
+        let (sort_ddl, sort_select): (Option<&str>, String) = match self.sort.as_str() {
             "grid" => (
-                "ALTER TABLE features SET SORTED BY (sortkey ASC, id ASC);".to_string(),
+                Some("ALTER TABLE features SET SORTED BY (sortkey ASC, id ASC)"),
                 format!(
                     "((ST_XMin({geometry}) - {}) * 100)::BIGINT * 1000 + ((ST_YMin({geometry}) - {}) * 100)::BIGINT,",
                     w.floor() as i64,
@@ -188,12 +199,13 @@ impl Build {
                 ),
             ),
             "hilbert" => (
-                "ALTER TABLE features SET SORTED BY (sortkey ASC, id ASC);".to_string(),
+                Some("ALTER TABLE features SET SORTED BY (sortkey ASC, id ASC)"),
                 format!(
                     "ST_Hilbert({geometry}, ST_Extent(ST_MakeEnvelope({w}, {s}, {e}, {n}))),"
                 ),
             ),
-            _ => ("-- preserve source insertion order".to_string(), "0,".to_string()),
+            // Preserve source insertion order.
+            _ => (None, "0,".to_string()),
         };
         // Build-time derivatives: centroids and display names are read on
         // every x/y/name projection and many tile paths. Pay once at build
@@ -206,23 +218,35 @@ impl Build {
         } else {
             format!("{data_url}/")
         });
-        conn.execute_batch(&format!(
-            "ATTACH {catalog_sql} AS lake (DATA_PATH {data_url_sql}); \
-             DETACH lake; \
-             ATTACH {catalog_sql} AS lake (DATA_PATH {staging_sql}, OVERRIDE_DATA_PATH true); \
-             USE lake; \
-             CALL lake.set_option('target_file_size', '{}MB'); \
-             CALL lake.set_option('parquet_row_group_size', {}); \
-             CALL lake.set_option('parquet_compression', 'zstd'); \
-             CALL lake.set_option('parquet_compression_level', 3); \
-             CREATE TABLE features( \
+        let mut setup = vec![
+            format!("ATTACH {catalog_sql} AS lake (DATA_PATH {data_url_sql})"),
+            "DETACH lake".to_string(),
+            format!(
+                "ATTACH {catalog_sql} AS lake (DATA_PATH {staging_sql}, OVERRIDE_DATA_PATH true)"
+            ),
+            "USE lake".to_string(),
+            format!(
+                "CALL lake.set_option('target_file_size', '{}MB')",
+                self.file_mb
+            ),
+            format!(
+                "CALL lake.set_option('parquet_row_group_size', {})",
+                self.row_group
+            ),
+            "CALL lake.set_option('parquet_compression', 'zstd')".to_string(),
+            "CALL lake.set_option('parquet_compression_level', 3)".to_string(),
+            "CREATE TABLE features( \
                id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON, \
                sortkey BIGINT, xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE, \
-               cx DOUBLE, cy DOUBLE, name VARCHAR); \
-             CREATE TABLE collections(id VARCHAR); \
-             {sort_ddl}",
-            self.file_mb, self.row_group
-        ))?;
+               cx DOUBLE, cy DOUBLE, name VARCHAR)"
+                .to_string(),
+            "CREATE TABLE collections(id VARCHAR)".to_string(),
+        ];
+        if let Some(ddl) = sort_ddl {
+            setup.push(ddl.to_string());
+        }
+        let setup_refs: Vec<&str> = setup.iter().map(String::as_str).collect();
+        db::execute_all(&conn, &setup_refs)?;
         let insert = format!(
             "INSERT INTO features \
              SELECT type || ':' || id::VARCHAR, {}::VARCHAR, {}::BIGINT, {geometry}, \
@@ -234,12 +258,15 @@ impl Build {
              AND {} {limit};",
             filter::quote(&self.collection), self.source_id,
             filter::spatial_predicate(self.bbox).replace("geom,", &format!("{geometry},")));
-        conn.execute_batch(&insert)?;
-        conn.execute_batch(
-            "INSERT INTO collections SELECT DISTINCT layer AS id FROM features ORDER BY id; \
-             CALL ducklake_flush_inlined_data('lake');",
+        conn.execute(insert.as_str(), Parameters::None)?;
+        db::execute_all(
+            &conn,
+            &[
+                "INSERT INTO collections SELECT DISTINCT layer AS id FROM features ORDER BY id",
+                "CALL ducklake_flush_inlined_data('lake')",
+            ],
         )?;
-        let count: i64 = conn.query_row("SELECT count(*) FROM features", [], |r| r.get(0))?;
+        let count = db::int_one(&conn, "SELECT count(*) FROM features")?;
         Ok(count)
     }
 }

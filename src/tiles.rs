@@ -1,7 +1,7 @@
 //! XYZ MVT extension. Spatial filtering is CRS84; tile encoding is Web Mercator.
 use crate::{
     api::{self, SourceQuery},
-    filter, plan,
+    db, filter, plan,
     store::{Error, Store},
 };
 use bytes::Bytes;
@@ -41,17 +41,12 @@ pub async fn tile(
             let fetch = Store::predicate(&collection, Some(bbox), &sources);
             // Empty tiles stay 204: check cheaply before paying for the
             // transform + encode.
-            let empty: Result<i32, _> = conn.query_row(
-                &format!("SELECT 1 FROM features WHERE {fetch} LIMIT 1"),
-                [],
-                |r| r.get(0),
-            );
-            match empty {
-                Ok(_) => {}
-                Err(duckdb::Error::QueryReturnedNoRows) => {
-                    return Ok(Bytes::new());
-                }
-                Err(e) => return Err(e.into()),
+            let empty = db::strings_col(
+                conn,
+                &format!("SELECT 'x' FROM features WHERE {fetch} LIMIT 1"),
+            )?;
+            if empty.is_empty() {
+                return Ok(Bytes::new());
             }
             // Page first, transform second: the inner scan selects raw
             // id/geom for the page, the outer runs Mercator + clip only
@@ -66,8 +61,8 @@ pub async fn tile(
                 north - span,
                 west + span
             );
-            let tile: Option<Vec<u8>> = conn.query_row(&sql, [], |r| r.get(0))?;
-            Ok(Bytes::from(tile.unwrap_or_default()))
+            let tile = db::blob_one(conn, &sql)?.unwrap_or_default();
+            Ok(Bytes::from(tile))
         })
         .await?;
     if body.bytes.is_empty() {
