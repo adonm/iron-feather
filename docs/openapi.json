@@ -22,6 +22,7 @@
           {"name": "bbox", "in": "query", "description": "CRS84 west,south,east,north, or west,south,minHeight,east,north,maxHeight. West greater than east crosses the antimeridian. Height does not restrict 2D features.", "style": "form", "explode": false, "schema": {"type": "array", "minItems": 4, "maxItems": 6, "items": {"type": "number"}}},
           {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 10}},
           {"name": "offset", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 4294967295, "default": 0}},
+          {"name": "cursor", "in": "query", "description": "Exclusive lower bound on feature id from a previous page's next link. Takes precedence over offset and seeks through the id index instead of skipping rows.", "schema": {"type": "string"}},
           {"name": "datetime", "in": "query", "style": "form", "explode": false, "description": "RFC3339 instant or start/end interval, with an open endpoint written as .. or empty. Layercake edit timestamps are not temporal geometry; these static features match every valid datetime.", "schema": {"type": "string"}}
         ],
         "responses": {

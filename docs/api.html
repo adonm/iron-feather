@@ -15,7 +15,8 @@ code { overflow-wrap: anywhere; }
 <pre>GET /collections/buildings/items?sources=1&amp;limit=10
 Accept: application/geo+json</pre>
 <p>Use <code>bbox=west,south,east,north</code> in longitude/latitude (CRS84).
-Follow <code>next</code> links for additional pages and each feature's <code>self</code> link for individual access.</p>
+Follow <code>next</code> links for additional pages and each feature's <code>self</code> link for individual access.
+<code>next</code> links carry an opaque <code>cursor</code> (exclusive lower bound on feature id) that seeks past previous pages; direct links may still use <code>offset</code>, which the cursor takes precedence over.</p>
 <p><code>sources</code> selects source IDs, intersected with <code>X-Source-Ids</code> if both are supplied.
 Omitting both returns no features. These are data filters, not authentication.</p>
 <p>Static features match every valid RFC3339 <code>datetime</code> instant or interval.

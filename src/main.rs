@@ -2,6 +2,7 @@ mod api;
 mod filter;
 mod flight;
 mod materialize;
+mod plan;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -33,9 +34,39 @@ enum Command {
         flight_listen: SocketAddr,
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
         connections: u16,
-        /// Total response-cache budget, split evenly between HTTP and Flight.
+        /// Requests beyond the pool queue for a connection up to this long.
+        #[arg(long, default_value_t = 250)]
+        max_wait_ms: u64,
+        /// Concurrent requests that may queue before failing fast.
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(0..))]
+        max_waiters: u16,
+        /// Concurrent Flight queries before bulk work fails fast. Defaults to
+        /// the pool size, which leaves bulk sharing the queue; lower it to
+        /// reserve connections for interactive OGC.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..))]
+        flight_concurrency: u16,
+        /// Response-cache budget for HTTP bytes. Flight runs uncached.
         #[arg(long, default_value_t = 256)]
         cache_mb: u32,
+        /// Shared DuckDB threads for the whole process. Keep at 1 for many
+        /// small concurrent queries; raise only with fewer connections for
+        /// bulk.
+        #[arg(long, default_value_t = 1)]
+        threads: i64,
+        /// Shared DuckDB memory budget in MiB. 0 leaves DuckDB's default.
+        #[arg(long, default_value_t = 0)]
+        memory_mb: u64,
+        /// Query execution deadline in ms for HTTP and Flight. 0 disables;
+        /// exceeded queries are interrupted and surface as backend failures.
+        #[arg(long, default_value_t = 30000)]
+        query_timeout_ms: u64,
+        /// Per-stream Flight buffer in MiB. Bounds one stream's buffered
+        /// Arrow bytes; oversized single batches drain first.
+        #[arg(long, default_value_t = 32)]
+        flight_stream_mb: u64,
+        /// Process-wide Flight buffer in MiB across all streams.
+        #[arg(long, default_value_t = 128)]
+        flight_total_mb: u64,
     },
 }
 
@@ -53,13 +84,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen,
             flight_listen,
             connections,
+            max_wait_ms,
+            max_waiters,
+            flight_concurrency,
             cache_mb,
+            threads,
+            memory_mb,
+            query_timeout_ms,
+            flight_stream_mb,
+            flight_total_mb,
         } => {
-            let store = Arc::new(store::Store::open(
-                &shard,
-                connections.into(),
-                u64::from(cache_mb) * 1024 * 1024,
-            )?);
+            let bulk_limit = if flight_concurrency == 0 {
+                connections.into()
+            } else {
+                flight_concurrency.into()
+            };
+            let store = Arc::new(store::Store::open_config(store::StoreConfig {
+                location: shard.clone(),
+                connections: connections.into(),
+                cache_bytes: u64::from(cache_mb) * 1024 * 1024,
+                max_waiters: max_waiters.into(),
+                max_wait: std::time::Duration::from_millis(max_wait_ms),
+                bulk_limit,
+                threads,
+                memory_mb,
+                query_timeout: std::time::Duration::from_millis(query_timeout_ms),
+                flight_stream_bytes: (flight_stream_mb.max(1) * 1024 * 1024) as usize,
+                flight_total_bytes: (flight_total_mb.max(1) * 1024 * 1024) as usize,
+            })?);
             tracing::info!(%listen, %flight_listen, %shard, "serving shard");
             let http = poem::Server::new(poem::listener::TcpListener::bind(listen))
                 .run(api::routes(store.clone()));

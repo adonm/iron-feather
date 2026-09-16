@@ -101,6 +101,39 @@ pub fn predicate(collection: &str, bounds: Option<[f64; 4]>, sources: &[i64]) ->
     sql
 }
 
+/// Plain min/max overlap over explicit bbox columns. Parquet statistics prune
+/// files and row groups on these cheap comparisons where no spatial index
+/// exists (DuckLake); the exact `ST_Intersects` predicate still decides.
+/// West > east crosses the antimeridian, so overlap is a union of two ranges.
+pub fn bbox_range(bounds: [f64; 4]) -> String {
+    bbox_overlap(bounds)
+}
+
+/// Overlap half of the DuckLake spatial filter: cheap min/max pruning.
+pub fn bbox_overlap(bounds: [f64; 4]) -> String {
+    let [w, s, e, n] = bounds;
+    let lat = format!("ymax >= {s} AND ymin <= {n}");
+    if w <= e {
+        format!("xmax >= {w} AND xmin <= {e} AND {lat}")
+    } else {
+        format!("(xmax >= {w} OR xmin <= {e}) AND {lat}")
+    }
+}
+
+/// Interior fast path: a geometry inside its own bbox, so a bbox fully inside
+/// the query window guarantees intersection without exact geometry work.
+/// Null or empty geometries never satisfy this; the `OR ST_Intersects` arm
+/// still decides boundary candidates.
+pub fn bbox_contained(bounds: [f64; 4]) -> String {
+    let [w, s, e, n] = bounds;
+    let lat = format!("ymin >= {s} AND ymax <= {n}");
+    if w <= e {
+        format!("xmin >= {w} AND xmax <= {e} AND {lat}")
+    } else {
+        format!("(xmin >= {w} OR xmax <= {e}) AND {lat}")
+    }
+}
+
 /// Layercake's edit timestamp isn't a feature's temporal extent. Features
 /// without temporal geometry match every valid OGC datetime filter.
 pub fn datetime(raw: &str) -> Result<(), String> {

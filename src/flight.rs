@@ -50,13 +50,19 @@ pub struct ShardFlight {
     pub store: Arc<Store>,
 }
 
+struct Planned {
+    candidates: Option<String>,
+    predicate: String,
+    projection: String,
+}
+
 impl ShardFlight {
     fn plan(
         &self,
         ticket: &ShardTicket,
         header: Option<Vec<i64>>,
         schema_only: bool,
-    ) -> Result<(Option<String>, String), Status> {
+    ) -> Result<Planned, Status> {
         self.store.collection(&ticket.collection)?;
         let columns = ticket
             .columns
@@ -75,10 +81,14 @@ impl ShardFlight {
                 "geometry" => "ST_AsWKB(geom) AS geometry",
                 "properties" => "properties::VARCHAR AS properties",
                 "source_id" => "source_id",
-                "x" => "ST_X(ST_Centroid(geom)) AS x",
-                "y" => "ST_Y(ST_Centroid(geom)) AS y",
-                "name" => "coalesce(json_extract_string(properties, '$.name'), json_extract_string(properties, '$.tags.name')) AS name",
-                _ => return Err(Status::invalid_argument(format!("unknown column: {column}"))),
+                // Build-time derivatives when the shard carries them;
+                // otherwise the equivalent computed expression.
+                "x" | "y" | "name" => self.store.derived_or(column),
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown column: {column}"
+                    )))
+                }
             });
         }
         let bbox = ticket
@@ -92,6 +102,11 @@ impl ShardFlight {
             return Err(Status::invalid_argument("limit must be <= 100000"));
         }
         let sources = filter::sources(ticket.sources.clone(), header);
+        let predicate = if self.store.is_lake() {
+            Store::lake_predicate(&ticket.collection, bbox, &sources)
+        } else {
+            filter::predicate(&ticket.collection, bbox, &sources)
+        };
         let candidates = (!schema_only).then(|| {
             format!(
                 "SELECT id FROM features WHERE {} ORDER BY id LIMIT {} OFFSET {}",
@@ -100,7 +115,11 @@ impl ShardFlight {
                 ticket.offset
             )
         });
-        Ok((candidates, select.join(", ")))
+        Ok(Planned {
+            candidates,
+            predicate,
+            projection: select.join(", "),
+        })
     }
 
     fn descriptor(descriptor: &FlightDescriptor) -> Result<ShardTicket, Status> {
@@ -123,8 +142,14 @@ impl ShardFlight {
 
     async fn info(&self, descriptor: FlightDescriptor) -> Result<FlightInfo, Status> {
         let ticket = Self::descriptor(&descriptor)?;
-        let (candidates, projection) = self.plan(&ticket, None, true)?;
-        let schema = self.store.arrow(candidates, projection).await?;
+        let planned = self.plan(&ticket, None, true)?;
+        let schema = if self.store.is_lake() {
+            self.store
+                .arrow_lake("FALSE".into(), planned.projection, 1, 0)
+                .await?
+        } else {
+            self.store.arrow(None, planned.projection).await?
+        };
         Ok(FlightInfo::new()
             .try_with_schema(&schema.schema)
             .map_err(|e| Status::internal(e.to_string()))?
@@ -174,8 +199,14 @@ impl FlightService for ShardFlight {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         let ticket = Self::descriptor(request.get_ref())?;
-        let (candidates, projection) = self.plan(&ticket, None, true)?;
-        let result = self.store.arrow(candidates, projection).await?;
+        let planned = self.plan(&ticket, None, true)?;
+        let result = if self.store.is_lake() {
+            self.store
+                .arrow_lake("FALSE".into(), planned.projection, 1, 0)
+                .await?
+        } else {
+            self.store.arrow(None, planned.projection).await?
+        };
         let schema = SchemaAsIpc::new(&result.schema, &Default::default())
             .try_into()
             .map_err(|e: duckdb::arrow::error::ArrowError| Status::internal(e.to_string()))?;
@@ -198,14 +229,63 @@ impl FlightService for ShardFlight {
                 filter::parse_sources(raw).map_err(Status::invalid_argument)
             })
             .transpose()?;
-        // Validate before consulting the cache; SQL includes the full request.
-        let (candidates, projection) = self.plan(&ticket, header, false)?;
-        let result = self.store.arrow(candidates, projection).await?;
+        // Validate before streaming; SQL includes the full request.
+        // Batches stream through per-stream and process-wide byte budgets;
+        // the guard lives in the response stream so premature drop marks
+        // cancellation and interrupts the query, while normal completion
+        // clears the handle before the connection is reused. The consumer
+        // releases both budgets on read.
+        let planned = self.plan(&ticket, header, false)?;
+        let batches = if self.store.is_lake() {
+            self.store
+                .arrow_lake_stream(
+                    planned.predicate,
+                    planned.projection,
+                    ticket.limit.unwrap_or(10_000),
+                    ticket.offset,
+                )
+                .await?
+        } else {
+            self.store
+                .arrow_stream(planned.candidates, planned.projection)
+                .await?
+        };
+        let schema = batches.schema.clone();
+        let input = futures::stream::unfold(
+            (
+                batches.batches,
+                batches.guard,
+                batches.buffered,
+                batches.global_buffered,
+            ),
+            |(mut rx, guard, buffered, global)| async move {
+                match rx.recv().await {
+                    Some(Ok(batch)) => {
+                        let size = batch.get_array_memory_size();
+                        buffered.fetch_sub(size, std::sync::atomic::Ordering::AcqRel);
+                        global.fetch_sub(size, std::sync::atomic::Ordering::AcqRel);
+                        Some((
+                            Ok(batch)
+                                as Result<
+                                    duckdb::arrow::record_batch::RecordBatch,
+                                    arrow_flight::error::FlightError,
+                                >,
+                            (rx, guard, buffered, global),
+                        ))
+                    }
+                    Some(Err(e)) => Some((
+                        Err(arrow_flight::error::FlightError::from_external_error(
+                            Box::new(e),
+                        )),
+                        (rx, guard, buffered, global),
+                    )),
+                    None => None,
+                }
+            },
+        );
         let stream = FlightDataEncoderBuilder::new()
-            .with_schema(result.schema.clone())
-            .build(futures::stream::iter(
-                result.batches.clone().into_iter().map(Ok),
-            ));
+            .with_schema(schema)
+            .build(input);
         Ok(Response::new(Box::pin(stream.map_err(Status::from))))
     }
 
