@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
-"""Print the DuckDB release (x.y.z) matching Cargo.lock's duckdb crate.
+"""Pinned DuckDB 2.0 nightly matching duckdb-rs fdd481e7's C API.
 
-duckdb-rs versions as 1.MAJOR_MINOR_PATCH.x where the second component
-encodes the DuckDB release (see libduckdb-sys build.rs), e.g. crate
-1.10505.0 -> DuckDB 1.5.5.
+Engine builds come from the rolling v2.0-cyanoptera artifacts (full GETs
+are rejected there; only Range reads succeed). The SHA-256 pins the exact
+bytes: a moved rolling build fails loudly instead of mixing versions.
 """
 
-import re
-import sys
-from pathlib import Path
-
-
-def main() -> None:
-    lock = Path("Cargo.lock").read_text()
-    m = re.search(r'name = "duckdb"\nversion = "1\.(\d+)\.(\d+)"', lock)
-    if not m:
-        print("error: duckdb crate not found in Cargo.lock", file=sys.stderr)
-        sys.exit(1)
-    enc = int(m.group(1))
-    major, minor, patch = enc // 10_000, (enc // 100) % 100, enc % 100
-    print(f"{major}.{minor}.{patch}")
-
+VERSION = "v2.0.0-alpha42069"
+BASE_URL = "https://artifacts.duckdb.org/v2.0-cyanoptera"
+ARCHIVES = {
+    "shared-libs": "13f9b355b36f5f9266a4bc44ef3c6fb29f548886fcbf9572b6e001844f1b6046",
+    "cli": "6102465b2f3270041cfa81f3628f60d3cf8f1bb70a7cbc457f00add2313e6fec",
+}
 
 if __name__ == "__main__":
-    main()
+    print(VERSION)

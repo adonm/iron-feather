@@ -30,7 +30,6 @@ pub async fn tile(
     let span = 2.0 * half / f64::from(1u32 << z);
     let west = -half + f64::from(x) * span;
     let north = half - f64::from(y) * span;
-    let lake = store.is_lake();
     // Key derives from the normalized inputs; SQL builds on miss so hits
     // pay validation + lookup only. Tiles hold up to 5k features and run
     // Mercator transforms, so they share the bulk lane with Flight.
@@ -39,64 +38,29 @@ pub async fn tile(
         .bytes(key, true, move |conn| {
             // Predicates build inside the worker: the cached path never
             // formats SQL.
-            let fetch = if lake {
-                Store::lake_predicate(&collection, Some(bbox), &sources)
-            } else {
-                String::new()
-            };
-            let candidate_sql = format!(
-                "SELECT id FROM features WHERE {} ORDER BY id LIMIT 5000",
-                filter::predicate(&collection, Some(bbox), &sources)
+            let fetch = Store::predicate(&collection, Some(bbox), &sources);
+            // Empty tiles stay 204: check cheaply before paying for the
+            // transform + encode.
+            let empty: Result<i32, _> = conn.query_row(
+                &format!("SELECT 1 FROM features WHERE {fetch} LIMIT 1"),
+                [],
+                |r| r.get(0),
             );
-            if lake {
-                // Empty tiles stay 204 like the native path: check cheaply
-                // before paying for the transform + encode.
-                let empty: Result<i32, _> = conn.query_row(
-                    &format!("SELECT 1 FROM features WHERE {fetch} LIMIT 1"),
-                    [],
-                    |r| r.get(0),
-                );
-                match empty {
-                    Ok(_) => {}
-                    Err(duckdb::Error::QueryReturnedNoRows) => {
-                        return Ok(Bytes::new());
-                    }
-                    Err(e) => return Err(e.into()),
+            match empty {
+                Ok(_) => {}
+                Err(duckdb::Error::QueryReturnedNoRows) => {
+                    return Ok(Bytes::new());
                 }
-                // Page first, transform second: the inner scan selects raw
-                // id/geom for the page, the outer runs Mercator + clip only
-                // over those rows instead of every scanned match.
-                let sql = format!(
-                    "SELECT ST_AsMVT(t, {}) FROM (SELECT id, ST_AsMVTGeom(\
-                     ST_Transform(page.geom, 'EPSG:4326', 'EPSG:3857', always_xy := true), \
-                     ST_Extent(ST_MakeEnvelope({west}, {}, {}, {north})), 4096, 64, true) AS geom \
-                     FROM (SELECT id, geom FROM features WHERE {fetch} ORDER BY id LIMIT 5000) AS page) t \
-                     WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)",
-                    filter::quote(&collection),
-                    north - span,
-                    west + span
-                );
-                let tile: Option<Vec<u8>> = conn.query_row(&sql, [], |r| r.get(0))?;
-                return Ok(Bytes::from(tile.unwrap_or_default()));
+                Err(e) => return Err(e.into()),
             }
-            let ids = conn
-                .prepare(&candidate_sql)?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            if ids.is_empty() {
-                return Ok(Bytes::new());
-            }
-            let filter = plan::native_payload_sql(&ids)
-                .replace(
-                    "SELECT id, ST_AsGeoJSON(geom), properties::VARCHAR FROM features WHERE ",
-                    "",
-                )
-                .replace(" ORDER BY id", "");
+            // Page first, transform second: the inner scan selects raw
+            // id/geom for the page, the outer runs Mercator + clip only
+            // over those rows instead of every scanned match.
             let sql = format!(
                 "SELECT ST_AsMVT(t, {}) FROM (SELECT id, ST_AsMVTGeom(\
-                 ST_Transform(geom, 'EPSG:4326', 'EPSG:3857', always_xy := true), \
+                 ST_Transform(page.geom, 'EPSG:4326', 'EPSG:3857', always_xy := true), \
                  ST_Extent(ST_MakeEnvelope({west}, {}, {}, {north})), 4096, 64, true) AS geom \
-                 FROM features WHERE {filter} ORDER BY id) t \
+                 FROM (SELECT id, geom FROM features WHERE {fetch} ORDER BY id LIMIT 5000) AS page) t \
                  WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)",
                 filter::quote(&collection),
                 north - span,

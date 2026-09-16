@@ -1,4 +1,4 @@
-//! Normalized requests and backend-specific query planning.
+//! Normalized requests and query planning.
 //!
 //! HTTP and Flight adapters validate first, then build one of these plans.
 //! Cache keys derive from the normalized request so equivalent spellings
@@ -118,55 +118,8 @@ pub fn is_heavy(limit: u32, pagination: &Pagination, bounds: Option<[f64; 4]>) -
     false
 }
 
-/// Native candidate selection: narrow id scan through the R-tree path.
-pub fn native_candidate_sql(
-    collection: &str,
-    bounds: Option<[f64; 4]>,
-    sources: &[i64],
-    limit: u32,
-    pagination: &Pagination,
-) -> String {
-    let base = filter::predicate(collection, bounds, sources);
-    let (filter, tail) = page_parts(&base, limit, pagination);
-    format!("SELECT id FROM features WHERE {filter} {tail}")
-}
-
-/// Native payload fetch through the single-column id index.
-pub fn native_payload_sql(ids: &[String]) -> String {
-    if ids.is_empty() {
-        return "SELECT id, ST_AsGeoJSON(geom), properties::VARCHAR FROM features WHERE FALSE"
-            .to_string();
-    }
-    format!(
-        "SELECT id, ST_AsGeoJSON(geom), properties::VARCHAR FROM features WHERE id IN ({}) ORDER BY id",
-        ids.iter()
-            .map(|id| filter::quote(id))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-/// DuckLake page query: one predicate-preserving scan, page first and
-/// conversion second so expensive projections run over page rows only.
-#[allow(dead_code)]
-pub fn lake_page_sql(
-    collection: &str,
-    bounds: Option<[f64; 4]>,
-    sources: &[i64],
-    projection: &str,
-    limit: u32,
-    pagination: &Pagination,
-    lake_predicate: &str,
-) -> String {
-    let _ = (collection, bounds, sources);
-    let (filter, tail) = page_parts(lake_predicate, limit, pagination);
-    format!(
-        "SELECT {projection} FROM (SELECT id, geom, properties, source_id, cx, cy, name FROM features WHERE {filter} {tail}) AS page ORDER BY page.id"
-    )
-}
-
-/// Items page SQL for the lake backend (GeoJSON conversion outside the page).
-pub fn lake_items_sql(req: &ItemsRequest, page_where: &str) -> String {
+/// Items page SQL (GeoJSON conversion outside the page).
+pub fn items_sql(req: &ItemsRequest, page_where: &str) -> String {
     let _ = req;
     format!(
         "SELECT id, ST_AsGeoJSON(geom), properties::VARCHAR FROM \
@@ -175,7 +128,7 @@ pub fn lake_items_sql(req: &ItemsRequest, page_where: &str) -> String {
     )
 }
 
-fn page_parts(base: &str, limit: u32, pagination: &Pagination) -> (String, String) {
+pub fn page_parts(base: &str, limit: u32, pagination: &Pagination) -> (String, String) {
     match pagination {
         Pagination::Cursor(cursor) => (
             format!("{} AND id > {}", base, filter::quote(cursor)),

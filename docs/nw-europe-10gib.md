@@ -1,5 +1,15 @@
 # 10 GB shard: fixture, layout experiment and S3 behavior
 
+> Historical record (DuckDB 1.5.5 era): this doc compares the removed
+> single-file backend against DuckLake and motivated the DuckLake-only
+> rewrite on the DuckDB 2.0 nightly. `just fixture-ducklake`,
+> `just fixture-verify-layouts`, `just bench-layouts` and
+> `scripts/build_ducklake.sh` no longer exist — `build` now writes the lake
+> layout directly (`--sort grid|hilbert|none --file-mb N --row-group N`).
+> The `--duck-disk-cache-dir` experiment below is also gone (`cache_httpfs`
+> has no 2.0 build); current tuning is HTTP/Parquet metadata caches plus
+> `NO_VALIDATION`. Re-run the matrix on the nightly before quoting ratios.
+
 Question: what does serving a ~10 GB shard look like, and does heap layout
 matter for direct S3 attachment? All runs below are loopback (no real S3
 latency), release builds, 8 shared connections unless stated.

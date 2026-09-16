@@ -1,15 +1,16 @@
 direction: down
 source: Layercake GeoParquet (HTTPS)
 build: iron-feather build
-shard: Immutable DuckDB (features + R-tree + id ART)
-remote: Optional HTTP/S3 read-only attachment
+catalog: DuckLake catalog (small, local or S3)
+parquet: Clustered Parquet files (S3)
 pool: Shared read-only connection pool
 http: OGC Features + XYZ MVT (cached bytes)
 flight: Arrow Flight (cached native Arrow batches)
 
 source -> build: bbox-pruned range reads
-build -> shard: atomic publication
-shard -> pool
-remote -> shard: range GETs
+build -> catalog: atomic publish
+build -> parquet: data files first
+catalog -> pool
+parquet -> pool: range GETs
 pool -> http
 pool -> flight

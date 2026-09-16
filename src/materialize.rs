@@ -1,8 +1,10 @@
-//! Remote I/O happens here, once. Serve only the completed local shard.
+//! Remote I/O happens here, once: Layercake GeoParquet becomes a versioned
+//! DuckLake snapshot (small catalog plus spatially clustered Parquet) ready
+//! to serve straight from S3.
 use crate::{filter, store::ShardManifest};
 use clap::Args;
 use duckdb::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Args, Debug)]
 pub struct Build {
@@ -17,23 +19,55 @@ pub struct Build {
     /// CRS84 west,south,east,north. Required to bound remote work.
     #[arg(long, allow_hyphen_values = true, value_parser = filter::parse_bbox)]
     pub bbox: [f64; 4],
-    #[arg(long, default_value = "fixtures/osm.duckdb")]
+    /// Output DuckLake catalog path.
+    #[arg(long, default_value = "fixtures/osm.ducklake")]
     pub out: PathBuf,
+    /// Local directory receiving the Parquet data files.
+    #[arg(long, default_value = "fixtures/osm.files")]
+    pub data_dir: PathBuf,
+    /// URL prefix the Parquet files will be served from. Defaults to the
+    /// data dir so a local build serves immediately; pass the S3/HTTPS
+    /// prefix when publishing, then sync the data dir there.
+    #[arg(long)]
+    pub data_url: Option<String>,
     /// Optional cap for development slices; omit to materialize the whole bbox.
     #[arg(long)]
     pub limit: Option<u32>,
-    /// Order heap rows by Hilbert value before indexing, so spatially close
-    /// rows share storage blocks. One-time build cost for fewer range reads.
-    #[arg(long)]
-    pub hilbert: bool,
+    /// Target Parquet file size in MiB.
+    #[arg(long, default_value_t = 128)]
+    pub file_mb: u64,
+    /// Parquet row-group size in rows.
+    #[arg(long, default_value_t = 65536)]
+    pub row_group: u64,
+    /// Row clustering for tight per-file bbox statistics: grid (default),
+    /// hilbert, or none (preserve source insertion order).
+    #[arg(long, default_value = "grid")]
+    pub sort: String,
     #[arg(long, default_value_t = 1)]
     pub source_id: i64,
+}
+
+fn publish_tree(source: &Path, dest: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let target = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            publish_tree(&entry.path(), &target)?;
+        } else if !target.exists() {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 impl Build {
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         if !filter::collection_id(&self.collection) {
             return Err("invalid collection id".into());
+        }
+        if !["grid", "hilbert", "none"].contains(&self.sort.as_str()) {
+            return Err("sort must be grid, hilbert, or none".into());
         }
         if self.out.exists() {
             return Err(format!("{} exists; build a new shard path", self.out.display()).into());
@@ -47,8 +81,24 @@ impl Build {
         let staging = tempfile::Builder::new()
             .prefix(".iron-feather-")
             .tempdir_in(parent)?;
-        let database = staging.path().join("shard.duckdb");
-        let rows = self.write(&database)?;
+        let staging_catalog = staging.path().join("catalog.ducklake");
+        let staging_data = staging.path().join("files");
+        std::fs::create_dir_all(&staging_data)?;
+        let data_url = self.data_url.clone().unwrap_or_else(|| {
+            let mut url = self.data_dir.to_string_lossy().into_owned();
+            if !url.ends_with('/') {
+                url.push('/');
+            }
+            url
+        });
+        let rows = self.write(&staging_catalog, &staging_data, &data_url)?;
+        // Publish data files first, then the catalog that references them.
+        // Existing published files are never deleted: another snapshot may
+        // still reference them. Layout nesting (schema/table dirs) is
+        // preserved so the catalog's relative paths keep resolving.
+        std::fs::create_dir_all(&self.data_dir)?;
+        publish_tree(&staging_data, &self.data_dir)?;
+        std::fs::rename(&staging_catalog, &self.out)?;
         // Versioned manifest travels atomically with the shard so servers
         // can verify the snapshot and clients can reason about layout.
         let built_at = std::time::SystemTime::now()
@@ -57,29 +107,37 @@ impl Build {
             .unwrap_or_default();
         let manifest = ShardManifest {
             version: 1,
-            backend: "native".to_string(),
+            backend: "lake".to_string(),
             schema_version: 2,
             source: self.from.clone(),
             bbox: self.bbox,
             rows,
             built_at,
-            layout: None,
+            layout: Some(crate::store::LakeLayout {
+                file_mb: self.file_mb,
+                row_group: self.row_group,
+                sort: self.sort.clone(),
+            }),
         };
-        let manifest_staging = staging.path().join("shard.manifest.json");
-        std::fs::write(&manifest_staging, serde_json::to_vec_pretty(&manifest)?)?;
-        // Publish the completed, closed database on the same filesystem,
-        // without overwriting a concurrently created shard. TempDir cleans up.
-        std::fs::hard_link(&database, &self.out)?;
         let manifest_out = format!("{}.manifest.json", self.out.display());
-        // Manifest is advisory; a concurrent build winning the shard path
-        // still leaves a matching manifest behind.
-        let _ = std::fs::hard_link(&manifest_staging, &manifest_out);
+        std::fs::write(&manifest_out, serde_json::to_vec_pretty(&manifest)?)?;
+        println!(
+            "materialized {rows} features into {} (+ {})",
+            self.out.display(),
+            self.data_dir.display()
+        );
         Ok(())
     }
 
-    fn write(&self, path: &std::path::Path) -> Result<i64, Box<dyn std::error::Error>> {
-        let conn = Connection::open(path)?;
+    fn write(
+        &self,
+        catalog: &Path,
+        staging_data: &Path,
+        data_url: &str,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let conn = Connection::open_in_memory()?;
         conn.execute_batch("INSTALL spatial; LOAD spatial;")?;
+        conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
         if self.from.starts_with("https://")
             || self.from.starts_with("http://")
             || self.from.starts_with("s3://")
@@ -117,35 +175,71 @@ impl Build {
             format!("(bbox.xmax >= {w} OR bbox.xmin <= {e})")
         };
         let limit = self.limit.map(|n| format!("LIMIT {n}")).unwrap_or_default();
-        let order = if self.hilbert {
-            format!("ORDER BY ST_Hilbert({geometry})")
-        } else {
-            String::new()
+        // Clustering for tight per-file bbox statistics: grid cells from the
+        // region origin keep nearby rows in the same files; Hilbert is the
+        // alternative when the source order is already scattered.
+        let (sort_ddl, sort_select) = match self.sort.as_str() {
+            "grid" => (
+                "ALTER TABLE features SET SORTED BY (sortkey ASC, id ASC);".to_string(),
+                format!(
+                    "((ST_XMin({geometry}) - {}) * 100)::BIGINT * 1000 + ((ST_YMin({geometry}) - {}) * 100)::BIGINT,",
+                    w.floor() as i64,
+                    s.floor() as i64
+                ),
+            ),
+            "hilbert" => (
+                "ALTER TABLE features SET SORTED BY (sortkey ASC, id ASC);".to_string(),
+                format!(
+                    "ST_Hilbert({geometry}, ST_Extent(ST_MakeEnvelope({w}, {s}, {e}, {n}))),"
+                ),
+            ),
+            _ => ("-- preserve source insertion order".to_string(), "0,".to_string()),
         };
         // Build-time derivatives: centroids and display names are read on
-        // every Flight x/y/name projection and many tile paths. Pay once at
-        // build instead of per row per request. Original geometry and full
+        // every x/y/name projection and many tile paths. Pay once at build
+        // instead of per row per request. Original geometry and full
         // properties stay authoritative.
-        let create = format!(
-            "CREATE TABLE features AS SELECT type || ':' || id::VARCHAR AS id, {}::VARCHAR AS layer, \
-             {}::BIGINT AS source_id, {geometry} AS geom, to_json(struct_pack({properties})) AS properties, \
-             ST_X(ST_Centroid({geometry})) AS cx, ST_Y(ST_Centroid({geometry})) AS cy, \
-             coalesce(json_extract_string(to_json(struct_pack({properties})), '$.name'), json_extract_string(to_json(struct_pack({properties})), '$.tags.name')) AS name \
+        let catalog_sql = filter::quote(&format!("ducklake:{}", catalog.to_string_lossy()));
+        let staging_sql = filter::quote(&format!("{}/", staging_data.to_string_lossy()));
+        let data_url_sql = filter::quote(&if data_url.ends_with('/') {
+            data_url.to_string()
+        } else {
+            format!("{data_url}/")
+        });
+        conn.execute_batch(&format!(
+            "ATTACH {catalog_sql} AS lake (DATA_PATH {data_url_sql}); \
+             DETACH lake; \
+             ATTACH {catalog_sql} AS lake (DATA_PATH {staging_sql}, OVERRIDE_DATA_PATH true); \
+             USE lake; \
+             CALL lake.set_option('target_file_size', '{}MB'); \
+             CALL lake.set_option('parquet_row_group_size', {}); \
+             CALL lake.set_option('parquet_compression', 'zstd'); \
+             CALL lake.set_option('parquet_compression_level', 3); \
+             CREATE TABLE features( \
+               id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON, \
+               sortkey BIGINT, xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE, \
+               cx DOUBLE, cy DOUBLE, name VARCHAR); \
+             CREATE TABLE collections(id VARCHAR); \
+             {sort_ddl}",
+            self.file_mb, self.row_group
+        ))?;
+        let insert = format!(
+            "INSERT INTO features \
+             SELECT type || ':' || id::VARCHAR, {}::VARCHAR, {}::BIGINT, {geometry}, \
+              to_json(struct_pack({properties})), {sort_select} \
+              ST_XMin({geometry}), ST_YMin({geometry}), ST_XMax({geometry}), ST_YMax({geometry}), \
+              ST_X(ST_Centroid({geometry})), ST_Y(ST_Centroid({geometry})), \
+              coalesce(json_extract_string(to_json(struct_pack({properties})), '$.name'), json_extract_string(to_json(struct_pack({properties})), '$.tags.name')) \
              FROM {input} WHERE {longitude} AND bbox.ymin <= {n} AND bbox.ymax >= {s} \
-             AND {} {order} {limit};",
+             AND {} {limit};",
             filter::quote(&self.collection), self.source_id,
             filter::spatial_predicate(self.bbox).replace("geom,", &format!("{geometry},")));
-        conn.execute_batch(&create)?;
-        conn.execute_batch(&format!(
-            "CREATE UNIQUE INDEX feature_id ON features(id); \
-             CREATE INDEX feature_geom ON features USING RTREE(geom); \
-             CREATE TABLE collections AS SELECT DISTINCT layer AS id FROM features ORDER BY id; \
-             CREATE TABLE provenance AS SELECT {} AS source, current_timestamp AS built_at; \
-             ANALYZE; CHECKPOINT;",
-            filter::quote(&self.from)
-        ))?;
+        conn.execute_batch(&insert)?;
+        conn.execute_batch(
+            "INSERT INTO collections SELECT DISTINCT layer AS id FROM features ORDER BY id; \
+             CALL ducklake_flush_inlined_data('lake');",
+        )?;
         let count: i64 = conn.query_row("SELECT count(*) FROM features", [], |r| r.get(0))?;
-        println!("materialized {count} features into {}", self.out.display());
         Ok(count)
     }
 }

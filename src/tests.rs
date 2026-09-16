@@ -28,12 +28,12 @@ struct Fixture {
     store: Arc<Store>,
 }
 
-fn install_spatial() {
+fn install_extensions() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
         Connection::open_in_memory()
             .unwrap()
-            .execute_batch("INSTALL spatial")
+            .execute_batch("INSTALL spatial; INSTALL ducklake; INSTALL httpfs")
             .unwrap()
     });
 }
@@ -49,29 +49,37 @@ impl Fixture {
         max_wait: std::time::Duration,
         bulk_limit: usize,
     ) -> Self {
-        install_spatial();
+        install_extensions();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shard.duckdb");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("LOAD spatial;
-            CREATE TABLE features(id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON, cx DOUBLE, cy DOUBLE, name VARCHAR);
+        let catalog = dir.path().join("shard.ducklake");
+        let files = dir.path().join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("LOAD spatial; LOAD ducklake; LOAD httpfs;")
+            .unwrap();
+        conn.execute_batch(&format!(
+            "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}/'); USE lake;
+            CREATE TABLE features(id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON,
+              sortkey BIGINT, xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE, cx DOUBLE, cy DOUBLE, name VARCHAR);
             INSERT INTO features VALUES
-              ('way:1', 'buildings', 1, ST_GeomFromText('POLYGON ((0 0,10 0,10 10,0 10,0 0))'), '{\"name\":\"Café\",\"height\":12}', 5, 5, 'Café'),
-              ('way:2', 'buildings', 2, ST_Point(12,12), '{\"name\":null}', 12, 12, NULL),
-              ('relation:1', 'buildings', 1, ST_GeomFromText('POLYGON ((-10 -10,-5 -10,-5 -5,-10 -5,-10 -10))'), '{}', -7.5, -7.5, NULL),
-              ('way:3', 'buildings', 1, ST_Point(179,2), '{}', 179, 2, NULL),
-              ('way:4', 'buildings', 1, ST_Point(-179,2), '{}', -179, 2, NULL),
-              ('way:5', 'buildings', 3, ST_Point(20,60), '{}', 20, 60, NULL),
-              ('way:road1', 'roads', 1, ST_GeomFromText('LINESTRING (0 0,20 20)'), '{}', 10, 10, NULL);
-            CREATE UNIQUE INDEX feature_id ON features(id);
-            CREATE INDEX feature_geom ON features USING RTREE(geom);
+              ('way:1', 'buildings', 1, ST_GeomFromText('POLYGON ((0 0,10 0,10 10,0 10,0 0))'), '{{\"name\":\"Café\",\"height\":12}}', 1, 0, 0, 10, 10, 5, 5, 'Café'),
+              ('way:2', 'buildings', 2, ST_Point(12,12), '{{\"name\":null}}', 2, 12, 12, 12, 12, 12, 12, NULL),
+              ('relation:1', 'buildings', 1, ST_GeomFromText('POLYGON ((-10 -10,-5 -10,-5 -5,-10 -5,-10 -10))'), '{{}}', 3, -10, -10, -5, -5, -7.5, -7.5, NULL),
+              ('way:3', 'buildings', 1, ST_Point(179,2), '{{}}', 4, 179, 2, 179, 2, 179, 2, NULL),
+              ('way:4', 'buildings', 1, ST_Point(-179,2), '{{}}', 5, -179, 2, -179, 2, -179, 2, NULL),
+              ('way:5', 'buildings', 3, ST_Point(20,60), '{{}}', 6, 20, 60, 20, 60, 20, 60, NULL),
+              ('way:road1', 'roads', 1, ST_GeomFromText('LINESTRING (0 0,20 20)'), '{{}}', 7, 0, 0, 20, 20, 10, 10, NULL);
             CREATE TABLE collections AS SELECT DISTINCT layer AS id FROM features;
-            CHECKPOINT;").unwrap();
+            CALL ducklake_flush_inlined_data('lake');",
+            catalog.to_str().unwrap(),
+            files.to_str().unwrap(),
+        ))
+        .unwrap();
         drop(conn);
         Self {
             store: Arc::new(
                 Store::open(
-                    path.to_str().unwrap(),
+                    catalog.to_str().unwrap(),
                     connections,
                     8 * 1024 * 1024,
                     max_waiters,
@@ -556,7 +564,7 @@ async fn flight_ids(service: &ShardFlight, request: Request<Ticket>) -> (Schema,
 }
 
 #[tokio::test]
-async fn flight_native_arrow_is_collection_scoped_and_limit_sensitive() {
+async fn flight_arrow_is_collection_scoped_and_limit_sensitive() {
     let fixture = Fixture::new(2);
     let service = ShardFlight {
         store: fixture.store,
@@ -855,7 +863,7 @@ async fn pool_bulk_cap_sheds_flight_without_touching_ogc() {
         let worker = store.clone();
         tasks.push(tokio::spawn(async move {
             worker
-                .arrow(Some("SELECT id FROM features".into()), "id".into())
+                .arrow("TRUE".into(), "id".into(), 100_000, 0)
                 .await
                 .map(|_| ())
         }));
@@ -997,7 +1005,7 @@ async fn shard_is_read_only_and_missing_files_are_not_created() {
         })
         .await
         .is_err());
-    let path = fixture._dir.path().join("missing.duckdb");
+    let path = fixture._dir.path().join("missing.ducklake");
     assert!(Store::open(
         path.to_str().unwrap(),
         1,
@@ -1014,7 +1022,7 @@ async fn shard_is_read_only_and_missing_files_are_not_created() {
 }
 
 fn tiny_parquet(dir: &tempfile::TempDir) -> std::path::PathBuf {
-    install_spatial();
+    install_extensions();
     let parquet = dir.path().join("source'quoted.parquet");
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
@@ -1030,19 +1038,27 @@ fn tiny_parquet(dir: &tempfile::TempDir) -> std::path::PathBuf {
     parquet
 }
 
+fn lake_build(dir: &tempfile::TempDir, parquet: &std::path::Path, name: &str, sort: &str) -> Build {
+    Build {
+        from: parquet.to_str().unwrap().into(),
+        collection: "buildings".into(),
+        bbox: [9.0, 9.0, 11.0, 11.0],
+        out: dir.path().join(name),
+        data_dir: dir.path().join(format!("{name}.files")),
+        data_url: None,
+        limit: None,
+        file_mb: 128,
+        row_group: 65536,
+        sort: sort.into(),
+        source_id: 7,
+    }
+}
+
 #[tokio::test]
 async fn materialization_preserves_layercake_ids_geometry_and_tags() {
     let dir = tempfile::tempdir().unwrap();
     let parquet = tiny_parquet(&dir);
-    let build = Build {
-        from: parquet.to_str().unwrap().into(),
-        collection: "buildings".into(),
-        bbox: [9.0, 9.0, 11.0, 11.0],
-        out: dir.path().join("local.duckdb"),
-        limit: None,
-        source_id: 7,
-        hilbert: false,
-    };
+    let build = lake_build(&dir, &parquet, "local.ducklake", "grid");
     build.run().unwrap();
     assert!(build.run().is_err()); // Never overwrite a published shard.
     std::fs::remove_file(parquet).unwrap(); // Serving no longer needs its source.
@@ -1082,18 +1098,10 @@ async fn materialization_preserves_layercake_ids_geometry_and_tags() {
 }
 
 #[tokio::test]
-async fn materialization_hilbert_orders_without_losing_rows() {
+async fn materialization_sort_orders_without_losing_rows() {
     let dir = tempfile::tempdir().unwrap();
     let parquet = tiny_parquet(&dir);
-    let build = Build {
-        from: parquet.to_str().unwrap().into(),
-        collection: "buildings".into(),
-        bbox: [9.0, 9.0, 11.0, 11.0],
-        out: dir.path().join("hilbert.duckdb"),
-        limit: None,
-        source_id: 7,
-        hilbert: true,
-    };
+    let build = lake_build(&dir, &parquet, "hilbert.ducklake", "hilbert");
     build.run().unwrap();
     let store = Arc::new(
         Store::open(
@@ -1120,176 +1128,25 @@ async fn materialization_hilbert_orders_without_losing_rows() {
     assert_eq!(page["numberReturned"], 2);
 }
 
-#[tokio::test]
-async fn ducklake_backend_serves_the_same_rows() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-    install_spatial();
-    static DUCKLAKE: std::sync::Once = std::sync::Once::new();
-    DUCKLAKE.call_once(|| {
-        Connection::open_in_memory()
-            .unwrap()
-            .execute_batch("INSTALL ducklake")
-            .unwrap()
-    });
-    let dir = tempfile::tempdir().unwrap();
-    let catalog = dir.path().join("test.ducklake");
-    std::fs::create_dir_all(dir.path().join("files")).unwrap();
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("LOAD spatial; LOAD ducklake; LOAD httpfs;")
-        .unwrap();
-    conn.execute_batch(&format!(
-        "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}'); USE lake;
-         CREATE TABLE features(id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON,
-           sortkey UBIGINT, xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE);
-         CREATE TABLE collections(id VARCHAR);
-         INSERT INTO features VALUES
-           ('way:1', 'buildings', 1, ST_Point(0, 0), '{{\"name\":\"Café\"}}', 1, 0, 0, 0, 0),
-           ('way:2', 'buildings', 2, ST_Point(12, 12), '{{}}', 2, 12, 12, 12, 12);
-         INSERT INTO collections VALUES ('buildings');",
-        catalog.to_str().unwrap(),
-        dir.path().join("files").to_str().unwrap(),
-    ))
-    .unwrap();
-    drop(conn);
-    let store = Arc::new(
-        Store::open(
-            catalog.to_str().unwrap(),
-            2,
-            1024 * 1024,
-            0,
-            std::time::Duration::ZERO,
-            2,
-            1,
-            0,
-            std::time::Duration::ZERO,
-        )
-        .unwrap(),
-    );
-    assert!(store.is_lake());
-    let client = TestClient::new(api::routes(store.clone()));
-    let page = body(
-        client
-            .get("/collections/buildings/items?sources=1")
-            .send()
-            .await,
-    )
-    .await;
-    assert_eq!(page["numberReturned"], 1);
-    assert_eq!(page["features"][0]["id"], "way:1");
-    // Interior fast path: fully contained point still matches.
-    let interior = body(
-        client
-            .get("/collections/buildings/items?sources=1&bbox=-1,-1,1,1")
-            .send()
-            .await,
-    )
-    .await;
-    assert_eq!(interior["numberReturned"], 1);
-    // Disjoint window still misses without touching exact geometry.
-    let outside = body(
-        client
-            .get("/collections/buildings/items?sources=1&bbox=5,5,6,6")
-            .send()
-            .await,
-    )
-    .await;
-    assert_eq!(outside["numberReturned"], 0);
-    // Single-query Arrow path agrees with the native two-step fetch.
-    let service = ShardFlight { store };
-    let stream = service
-        .do_get(ticket(
-            serde_json::json!({"collection": "buildings", "sources": [1]}),
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .map_err(arrow_flight::error::FlightError::from);
-    let mut batches = FlightRecordBatchStream::new_from_flight_data(stream);
-    let mut ids = Vec::new();
-    while let Some(batch) = batches.try_next().await.unwrap() {
-        let column = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        ids.extend(column.iter().map(|s| s.unwrap().to_string()));
-    }
-    assert_eq!(ids, ["way:1"]);
-}
-
 #[test]
 fn failed_build_does_not_publish_or_leave_partial_files() {
-    install_spatial();
+    install_extensions();
     let dir = tempfile::tempdir().unwrap();
     let build = Build {
         from: dir.path().join("absent.parquet").to_str().unwrap().into(),
         collection: "buildings".into(),
         bbox: [0.0, 0.0, 1.0, 1.0],
-        out: dir.path().join("local.duckdb"),
+        out: dir.path().join("local.ducklake"),
+        data_dir: dir.path().join("local.ducklake.files"),
+        data_url: None,
         limit: None,
+        file_mb: 128,
+        row_group: 65536,
+        sort: "grid".into(),
         source_id: 1,
-        hilbert: false,
     };
     assert!(build.run().is_err());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-}
-
-#[tokio::test]
-async fn lake_tiles_page_first_transform_matches() {
-    install_spatial();
-    static DUCKLAKE_TILE: std::sync::Once = std::sync::Once::new();
-    DUCKLAKE_TILE.call_once(|| {
-        Connection::open_in_memory()
-            .unwrap()
-            .execute_batch("INSTALL ducklake")
-            .unwrap()
-    });
-    let dir = tempfile::tempdir().unwrap();
-    let catalog = dir.path().join("tile.ducklake");
-    std::fs::create_dir_all(dir.path().join("files")).unwrap();
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("LOAD spatial; LOAD ducklake; LOAD httpfs;")
-        .unwrap();
-    conn.execute_batch(&format!(
-        "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}'); USE lake;
-         CREATE TABLE features(id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON,
-           sortkey UBIGINT, xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE);
-         CREATE TABLE collections(id VARCHAR);
-         INSERT INTO features VALUES
-           ('way:1', 'buildings', 1, ST_Point(0, 0), '{{}}', 1, 0, 0, 0, 0);
-         INSERT INTO collections VALUES ('buildings');",
-        catalog.to_str().unwrap(),
-        dir.path().join("files").to_str().unwrap(),
-    ))
-    .unwrap();
-    drop(conn);
-    let store = Arc::new(
-        Store::open(
-            catalog.to_str().unwrap(),
-            2,
-            1024 * 1024,
-            0,
-            std::time::Duration::ZERO,
-            2,
-            1,
-            0,
-            std::time::Duration::ZERO,
-        )
-        .unwrap(),
-    );
-    let client = TestClient::new(api::routes(store));
-    // World tile contains the point; a far southern tile does not.
-    client
-        .get("/collections/buildings/tiles/0/0/0?sources=1")
-        .send()
-        .await
-        .assert_status_is_ok();
-    client
-        .get("/collections/buildings/tiles/2/3/3?sources=1")
-        .send()
-        .await
-        .assert_status(StatusCode::NO_CONTENT);
 }
 
 #[test]
@@ -1326,29 +1183,30 @@ fn bbox_overlap_and_contained_handle_antimeridian() {
 }
 
 #[test]
-fn lake_predicate_prunes_then_accepts_interior_or_intersects() {
-    let sql = crate::store::Store::lake_predicate("buildings", Some([0.0, 0.0, 10.0, 10.0]), &[1]);
+fn predicate_prunes_then_accepts_interior_or_intersects() {
+    let sql = crate::store::Store::predicate("buildings", Some([0.0, 0.0, 10.0, 10.0]), &[1]);
     assert!(sql.contains("xmax >= 0 AND xmin <= 10"));
     assert!(sql.contains("xmin >= 0 AND xmax <= 10"));
     assert!(sql.contains("ST_Intersects"));
     // No spatial arm without bounds.
-    let bare = crate::store::Store::lake_predicate("buildings", None, &[1]);
+    let bare = crate::store::Store::predicate("buildings", None, &[1]);
     assert!(!bare.contains("ST_Intersects"));
     assert!(bare.contains("source_id IN (1)"));
 }
 
 #[tokio::test]
 async fn store_rejects_bad_engine_budgets() {
+    // threads=0 fails before any storage is touched.
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("shard.duckdb");
-    Connection::open(&path)
+    let location = dir
+        .path()
+        .join("shard.ducklake")
+        .to_str()
         .unwrap()
-        .execute_batch("CREATE TABLE features(id VARCHAR); CREATE TABLE collections(id VARCHAR);")
-        .unwrap();
-    let location = path.to_str().unwrap();
+        .to_string();
     assert!(
         Store::open(
-            location,
+            &location,
             1,
             0,
             0,
@@ -1435,7 +1293,7 @@ async fn streaming_drop_before_schema_does_not_strand_the_pool() {
     // Start a stream and drop it immediately (before/without reading
     // schema): cancellation must return the connection promptly.
     let batches = store
-        .arrow_stream(Some("SELECT id FROM features".into()), "id".into())
+        .arrow_stream("TRUE".into(), "id".into(), 100_000, 0)
         .await
         .unwrap();
     drop(batches);
@@ -1456,7 +1314,7 @@ async fn streaming_slow_reader_still_completes_under_budgets() {
     let fixture = Fixture::new(2);
     let mut batches = fixture
         .store
-        .arrow_stream(Some("SELECT id FROM features".into()), "id".into())
+        .arrow_stream("TRUE".into(), "id".into(), 100_000, 0)
         .await
         .unwrap();
     let mut count = 0;
@@ -1480,10 +1338,7 @@ async fn streaming_reports_mid_stream_failure_as_error() {
     // never as a silently truncated stream.
     let result = fixture
         .store
-        .arrow_stream(
-            Some("SELECT id FROM features".into()),
-            "no_such_column".into(),
-        )
+        .arrow_stream("TRUE".into(), "no_such_column".into(), 100_000, 0)
         .await;
     assert!(result.is_err());
     fixture.store.run(|_| Ok(())).await.unwrap();
@@ -1497,7 +1352,7 @@ async fn oversized_batch_drains_instead_of_spinning() {
     let fixture = Fixture::new(1);
     let mut batches = fixture
         .store
-        .arrow_stream(Some("SELECT id FROM features".into()), "id".into())
+        .arrow_stream("TRUE".into(), "id".into(), 100_000, 0)
         .await
         .unwrap();
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), batches.batches.recv())
@@ -1538,16 +1393,20 @@ async fn heavy_pages_share_the_bulk_lane() {
 
 #[test]
 fn manifest_round_trips_through_serde() {
-    use crate::store::ShardManifest;
+    use crate::store::{LakeLayout, ShardManifest};
     let manifest = ShardManifest {
         version: 1,
-        backend: "native".into(),
+        backend: "lake".into(),
         schema_version: 2,
         source: "test".into(),
         bbox: [2.0, 48.0, 6.0, 54.0],
         rows: 7,
         built_at: "0".into(),
-        layout: None,
+        layout: Some(LakeLayout {
+            file_mb: 128,
+            row_group: 65536,
+            sort: "grid".into(),
+        }),
     };
     let text = serde_json::to_string(&manifest).unwrap();
     let back: ShardManifest = serde_json::from_str(&text).unwrap();
@@ -1561,10 +1420,7 @@ fn duck_tuning_defaults_are_pragmatic() {
     let cfg = StoreConfig::default();
     assert!(cfg.http_metadata_cache);
     assert!(cfg.parquet_metadata_cache);
-    assert!(cfg.http_connection_cache);
-    assert!(!cfg.parquet_prefetch_all);
     assert!(cfg.no_validation);
-    assert!(cfg.disk_cache_dir.is_none());
 }
 
 #[tokio::test]
@@ -1585,8 +1441,6 @@ async fn duck_tuning_flags_reach_duckdb_settings() {
     let cfg = StoreConfig {
         http_metadata_cache: true,
         parquet_metadata_cache: true,
-        http_connection_cache: true,
-        parquet_prefetch_all: false,
         no_validation: true,
         ..StoreConfig::default()
     };
@@ -1615,7 +1469,6 @@ async fn duck_tuning_flags_reach_duckdb_settings() {
     };
     assert_eq!(get("enable_http_metadata_cache"), "true");
     assert_eq!(get("parquet_metadata_cache"), "true");
-    assert_eq!(get("httpfs_connection_caching"), "true");
     assert_eq!(get("validate_external_file_cache"), "NO_VALIDATION");
     assert_eq!(get_clone("enable_http_metadata_cache"), "true");
 }

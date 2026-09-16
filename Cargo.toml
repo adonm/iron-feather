@@ -3,9 +3,9 @@ name = "iron-feather"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "OGC API Features, vector tiles and Arrow Flight over one DuckDB shard"
+description = "OGC API Features, vector tiles and Arrow Flight over DuckLake on S3"
 repository = "https://github.com/adonm/iron-feather"
-rust-version = "1.85"
+rust-version = "1.85.1"
 
 [dependencies]
 poem = { version = "3", features = ["server"] }
@@ -28,11 +28,11 @@ martin-tile-utils = "0.7"
 # Prebuilt binaries only: `default-features = false` guarantees the `bundled`
 # C++ build never kicks in. Linked lib comes from $DUCKDB_LIB_DIR
 # (`just setup-duckdb`) or the build-script auto-download.
-duckdb = { version = "1.10505", default-features = false }
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", rev = "fdd481e7fbc5fa4e59a715431ffa9d40c94b5956", default-features = false }
 moka = { version = "0.12", features = ["future"] }
 tonic = "0.14"
 # Match duckdb's Arrow major so batches pass directly into Flight.
-arrow-flight = "58"
+arrow-flight = "59"
 futures = "0.3"
 tempfile = "3"
 

@@ -51,18 +51,12 @@ pub struct ShardFlight {
 }
 
 struct Planned {
-    candidates: Option<String>,
     predicate: String,
     projection: String,
 }
 
 impl ShardFlight {
-    fn plan(
-        &self,
-        ticket: &ShardTicket,
-        header: Option<Vec<i64>>,
-        schema_only: bool,
-    ) -> Result<Planned, Status> {
+    fn plan(&self, ticket: &ShardTicket, header: Option<Vec<i64>>) -> Result<Planned, Status> {
         self.store.collection(&ticket.collection)?;
         let columns = ticket
             .columns
@@ -102,21 +96,8 @@ impl ShardFlight {
             return Err(Status::invalid_argument("limit must be <= 100000"));
         }
         let sources = filter::sources(ticket.sources.clone(), header);
-        let predicate = if self.store.is_lake() {
-            Store::lake_predicate(&ticket.collection, bbox, &sources)
-        } else {
-            filter::predicate(&ticket.collection, bbox, &sources)
-        };
-        let candidates = (!schema_only).then(|| {
-            format!(
-                "SELECT id FROM features WHERE {} ORDER BY id LIMIT {} OFFSET {}",
-                filter::predicate(&ticket.collection, bbox, &sources),
-                limit,
-                ticket.offset
-            )
-        });
+        let predicate = Store::predicate(&ticket.collection, bbox, &sources);
         Ok(Planned {
-            candidates,
             predicate,
             projection: select.join(", "),
         })
@@ -142,14 +123,11 @@ impl ShardFlight {
 
     async fn info(&self, descriptor: FlightDescriptor) -> Result<FlightInfo, Status> {
         let ticket = Self::descriptor(&descriptor)?;
-        let planned = self.plan(&ticket, None, true)?;
-        let schema = if self.store.is_lake() {
-            self.store
-                .arrow_lake("FALSE".into(), planned.projection, 1, 0)
-                .await?
-        } else {
-            self.store.arrow(None, planned.projection).await?
-        };
+        let planned = self.plan(&ticket, None)?;
+        let schema = self
+            .store
+            .arrow("FALSE".into(), planned.projection, 1, 0)
+            .await?;
         Ok(FlightInfo::new()
             .try_with_schema(&schema.schema)
             .map_err(|e| Status::internal(e.to_string()))?
@@ -199,14 +177,11 @@ impl FlightService for ShardFlight {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         let ticket = Self::descriptor(request.get_ref())?;
-        let planned = self.plan(&ticket, None, true)?;
-        let result = if self.store.is_lake() {
-            self.store
-                .arrow_lake("FALSE".into(), planned.projection, 1, 0)
-                .await?
-        } else {
-            self.store.arrow(None, planned.projection).await?
-        };
+        let planned = self.plan(&ticket, None)?;
+        let result = self
+            .store
+            .arrow("FALSE".into(), planned.projection, 1, 0)
+            .await?;
         let schema = SchemaAsIpc::new(&result.schema, &Default::default())
             .try_into()
             .map_err(|e: duckdb::arrow::error::ArrowError| Status::internal(e.to_string()))?;
@@ -235,21 +210,16 @@ impl FlightService for ShardFlight {
         // cancellation and interrupts the query, while normal completion
         // clears the handle before the connection is reused. The consumer
         // releases both budgets on read.
-        let planned = self.plan(&ticket, header, false)?;
-        let batches = if self.store.is_lake() {
-            self.store
-                .arrow_lake_stream(
-                    planned.predicate,
-                    planned.projection,
-                    ticket.limit.unwrap_or(10_000),
-                    ticket.offset,
-                )
-                .await?
-        } else {
-            self.store
-                .arrow_stream(planned.candidates, planned.projection)
-                .await?
-        };
+        let planned = self.plan(&ticket, header)?;
+        let batches = self
+            .store
+            .arrow_stream(
+                planned.predicate,
+                planned.projection,
+                ticket.limit.unwrap_or(10_000),
+                ticket.offset,
+            )
+            .await?;
         let schema = batches.schema.clone();
         let input = futures::stream::unfold(
             (

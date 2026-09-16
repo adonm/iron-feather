@@ -442,13 +442,6 @@ fn feature(
     })
 }
 
-fn candidate_ids(conn: &duckdb::Connection, sql: &str) -> Result<Vec<String>, Error> {
-    Ok(conn
-        .prepare(sql)?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?)
-}
-
 fn fetch_rows(
     conn: &duckdb::Connection,
     sql: &str,
@@ -477,25 +470,6 @@ fn rows_to_features(
             feature(id, geometry, properties, links)
         })
         .collect()
-}
-
-fn features(
-    conn: &duckdb::Connection,
-    ids: &[String],
-    collection: &str,
-    sources: &[i64],
-) -> Result<Vec<Feature>, Error> {
-    if ids.is_empty() {
-        return Ok(vec![]);
-    }
-    let sql = format!(
-        "SELECT {FEATURE_COLUMNS} FROM features WHERE id IN ({}) ORDER BY id",
-        ids.iter()
-            .map(|id| filter::quote(id))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    rows_to_features(fetch_rows(conn, &sql)?, collection, sources)
 }
 
 /// Normalized page inputs live in [`plan::ItemsRequest`]: equivalent
@@ -546,62 +520,25 @@ async fn items(
     // validation, canonical-key creation, lookup and response assembly only.
     // A cursor bounds the id range, so DuckDB starts at the page instead of
     // discarding `offset` leading rows. Offset stays for direct links.
-    let lake = store.is_lake();
     let limit = query.limit;
     let query: QueryFn = Box::new(move |conn: &duckdb::Connection| {
         let selected = std::time::Instant::now();
         let req_owned = normalized.clone();
         let pagination = req_owned.pagination.clone();
-        let base_predicate = if lake {
-            Store::lake_predicate(&req_owned.collection, req_owned.bounds, &req_owned.sources)
-        } else {
-            filter::predicate(&req_owned.collection, req_owned.bounds, &req_owned.sources)
-        };
-        let (page_filter, page_tail) = match &pagination {
-            Pagination::Cursor(cursor) => (
-                format!("{} AND id > {}", base_predicate, filter::quote(cursor)),
-                format!("ORDER BY id LIMIT {}", limit + 1),
-            ),
-            Pagination::Offset(offset) => (
-                base_predicate,
-                format!("ORDER BY id LIMIT {} OFFSET {}", limit + 1, offset),
-            ),
-        };
-        // DuckLake has no ART index for the two-step fetch, so the page
-        // payload comes from the same predicate-preserving scan. Page first,
-        // convert second: the inner scan selects raw columns for the page,
-        // the outer converts only those rows to GeoJSON.
-        let lake_sql = plan::lake_items_sql(&req_owned, &format!("{page_filter} {page_tail}"));
-        let candidate_sql = plan::native_candidate_sql(
-            &req_owned.collection,
-            req_owned.bounds,
-            &req_owned.sources,
-            limit,
-            &pagination,
-        );
-        let (page, has_next, last_id): (Vec<Feature>, bool, Option<String>) = if lake {
-            let rows = fetch_rows(conn, &lake_sql)?;
+        let base_predicate =
+            Store::predicate(&req_owned.collection, req_owned.bounds, &req_owned.sources);
+        let (page_filter, page_tail) = plan::page_parts(&base_predicate, limit, &pagination);
+        // Page first, convert second: the inner scan selects raw columns for
+        // the page, the outer converts only those rows to GeoJSON.
+        let sql = plan::items_sql(&req_owned, &format!("{page_filter} {page_tail}"));
+        let rows = fetch_rows(conn, &sql)?;
+        let (page, has_next, last_id): (Vec<Feature>, bool, Option<String>) = {
             let has_next = rows.len() > limit as usize;
             let mut rows = rows;
             rows.truncate(limit as usize);
             let last_id = rows.last().map(|row| row.0.clone());
             let fetched = std::time::Instant::now();
             let page = rows_to_features(rows, &req_owned.collection, &req_owned.sources)?;
-            let assembled = std::time::Instant::now();
-            tracing::debug!(
-                candidate_us = fetched.duration_since(selected).as_micros(),
-                fetch_us = assembled.duration_since(fetched).as_micros(),
-                encode_us = 0,
-                "ogc items render"
-            );
-            (page, has_next, last_id)
-        } else {
-            let mut ids = candidate_ids(conn, &candidate_sql)?;
-            let has_next = ids.len() > limit as usize;
-            ids.truncate(limit as usize);
-            let last_id = ids.last().cloned();
-            let fetched = std::time::Instant::now();
-            let page = features(conn, &ids, &req_owned.collection, &req_owned.sources)?;
             let assembled = std::time::Instant::now();
             tracing::debug!(
                 candidate_us = fetched.duration_since(selected).as_micros(),

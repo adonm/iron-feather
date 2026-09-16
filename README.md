@@ -1,16 +1,17 @@
 # iron-feather
 
-**Build one DuckDB shard, then serve it through OGC REST and Arrow Flight.**
-The default fast path reads a local immutable copy; read-only HTTP/S3 attachment
-is available for experiments and lower-local-storage deployments.
+**Build a DuckLake snapshot on S3, then serve it through OGC REST and Arrow Flight.**
 
 ```text
 OSM Layercake GeoParquet (HTTPS)
-  → bbox-pruned import → immutable DuckDB + R-tree + feature-id index
+  → bbox-pruned import → DuckLake catalog + clustered Parquet (local or S3)
                           └─ shared read-only connection pool
                                ├─ OGC Features / XYZ tiles → cached response bytes
                                └─ Arrow Flight → native DuckDB Arrow batches (uncached)
 ```
+
+One binary, two commands, one snapshot. Apache-2.0. DuckDB 2.0 nightly
+(`v2.0.0-alpha42069`; see `scripts/duckdb_version.py` for the exact pin).
 
 One binary, two commands, one shard. Apache-2.0.
 
@@ -21,7 +22,7 @@ Install stable Rust with rustup and `just` with `mise install`, then:
 ```sh
 just fixture-osm --limit 20000    # Layercake buildings, central Berlin
 just fmt-check check test
-just run                        # fixtures/osm.duckdb; HTTP :3000, Flight :50051
+just run                        # fixtures/osm.ducklake; HTTP :3000, Flight :50051
 ```
 
 ```sh
@@ -40,8 +41,8 @@ export LD_LIBRARY_PATH="$DUCKDB_LIB_DIR"       # macOS: DYLD_LIBRARY_PATH
 cargo run --locked -- build \
   --from https://data.openstreetmap.us/layercake/buildings.parquet \
   --collection buildings --bbox=13.35,52.48,13.45,52.55 \
-  --out fixtures/berlin.duckdb
-cargo run --locked --release -- serve --shard fixtures/berlin.duckdb
+  --out fixtures/berlin.ducklake --data-dir fixtures/berlin.files
+cargo run --locked --release -- serve --shard fixtures/berlin.ducklake
 ```
 
 ## Materialization
@@ -57,63 +58,54 @@ The resulting schema is:
 
 ```text
 features(id VARCHAR, layer VARCHAR, source_id BIGINT, geom GEOMETRY, properties JSON,
-         cx DOUBLE, cy DOUBLE, name VARCHAR)
+         sortkey BIGINT, xmin/ymin/xmax/ymax DOUBLE, cx DOUBLE, cy DOUBLE, name VARCHAR)
 collections(id VARCHAR)
-provenance(source VARCHAR, built_at TIMESTAMPTZ)
 ```
 
 Geometry is non-null, 2D CRS84 (longitude/latitude). Import uses both Parquet
-bbox statistics and exact geometry intersection, then creates an R-tree and a
-unique single-column `id` index. IDs must therefore be globally unique within a
-shard. `cx`/`cy`/`name` are build-time derivatives (centroid coordinates and
+bbox statistics and exact geometry intersection, then writes ZSTD Parquet
+clustered by `--sort` (`grid` cell, `hilbert`, or `none`) with tight per-file
+bbox statistics (`xmin/ymin/xmax/ymax` min/max pruning replaces a spatial
+index). `cx`/`cy`/`name` are build-time derivatives (centroid coordinates and
 display name) so Flight `x`/`y`/`name` projections avoid per-row geometry and
-JSON work; older shards without them keep serving through computed fallbacks.
-`--source-id` defaults to `1`. Metadata is discovered from the shard's
-actual layers; other materializers can populate this schema with multiple
-collections. A versioned `<shard>.manifest.json` (backend, schema version,
-source, bbox, rows, layout) is written atomically alongside the shard.
+JSON work. `--source-id` defaults to `1`. Metadata is discovered from the
+shard's actual layers. A versioned `<catalog>.manifest.json` (backend,
+schema version, source, bbox, rows, layout) is written alongside the catalog.
 
-Publication is atomic and refuses to overwrite an existing shard. Build a new
-file and restart `serve --shard NEW_FILE` to switch snapshots. Completed shards
-can be served without the remote source. The serving host needs the matching
-DuckDB `spatial` extension installed; `build` installs it automatically.
+Publication is atomic and refuses to overwrite an existing catalog: data
+files publish first (never deleting files another snapshot references), then
+the catalog that references them. Build a new snapshot and restart
+`serve --shard NEW_CATALOG` to switch. The serving host needs the matching
+DuckDB `spatial`/`ducklake` extensions installed; `build` installs them
+automatically. `--data-url` records the prefix the Parquet files will be
+served from (defaults to the local data dir); sync the data dir to S3/HTTPS
+afterwards when publishing remotely.
 
 ```sh
 just fixture-nw-europe            # ~10 GB Benelux + N. France buildings
-just fixture-nw-europe-hilbert out=fixtures/nw-europe-hilbert.duckdb
-just fixture-verify shard=fixtures/nw-europe.duckdb
+just fixture-verify shard=fixtures/nw-europe.ducklake
 just workloads                    # saved deterministic request sets
 ```
 
-`--hilbert` orders heap rows by Hilbert value before indexing, so spatially
-close rows share storage blocks at the cost of a one-time sort during build.
 `just workloads` writes hot, urban, rural, scattered, broad, empty, deep and
 mixed URL sets for `bench-http --workload`; regenerate with `--region` for a
 different shard extent.
 
-### Remote attachment
+### Serving from S3
 
-`serve --shard` also accepts an HTTP(S) URL or public/preconfigured `s3://`
-location and attaches it read-only through DuckDB `httpfs`. A `.ducklake`
-catalog path or URL selects the DuckLake backend instead: same endpoints,
-pool and response cache, with single predicate-preserving scans in place of
-the narrow-ID two-step fetch (DuckLake has no R-tree or ART indexes). See
-[`docs/nw-europe-10gib.md`](docs/nw-europe-10gib.md) for the layout
-comparison. For private S3,
+`serve --shard` takes a local `.ducklake` catalog path or the HTTP(S)/`s3://`
+URL of a published catalog and attaches it read-only. For private S3,
 prefer a short-lived presigned HTTPS object URL; the binary deliberately does
 not accept cloud credentials. Every pooled connection is switched to the
-attached catalog before external access is locked down on single-file
-backends; DuckLake resolves its Parquet data files at query time, so the
-lockdown stays off there and all SQL remains server-generated.
+attached catalog; DuckLake resolves its Parquet data files at query time, so
+all SQL remains server-generated.
 
-Remote spatial queries use late materialization: the R-tree first returns only
-candidate IDs, then geometry/properties are fetched through the ID ART index.
-Without this split, a cold 5 GB remote query downloaded/materialized about 4 GB.
-See [`docs/s3-benchmark.md`](docs/s3-benchmark.md) for the full local versus
-`rclone serve s3` comparison, and [`docs/nw-europe-10gib.md`](docs/nw-europe-10gib.md)
-for the 25M-row fixture, workload battery, heap-layout experiment and
-per-request S3 accounting. Local NVMe remains the recommended production
-path for predictable cold latency.
+Spatial queries prune by file/row-group bbox statistics, then run exact
+`ST_Intersects` only on boundary candidates (fully contained bboxes skip it).
+Page-first planning converts geometry only for the returned page. See
+[`docs/nw-europe-10gib.md`](docs/nw-europe-10gib.md) for the 25M-row fixture,
+workload battery and per-request S3 accounting. [`docs/s3-benchmark.md`](docs/s3-benchmark.md)
+records the earlier single-file era and is superseded by the DuckLake design.
 
 Layercake data is © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright),
 available under the [ODbL](https://opendatacommons.org/licenses/odbl/).
@@ -184,11 +176,10 @@ lane. `--threads` sets shared DuckDB threads for the whole process
 fewer connections for bulk) and `--memory-mb` caps shared DuckDB memory in
 MiB (default 4096, sized for the ~10 GB shard urban working set; 0 leaves
 DuckDB's unbounded default). Remote shards also enable DuckDB's HTTP
-metadata cache, Parquet metadata cache, HTTP connection reuse and
-`NO_VALIDATION` for the immutable external-file cache by default; each can
-be flipped (`--disable-http-metadata-cache`,
-`--disable-parquet-metadata-cache`, `--disable-connection-cache`,
-`--enable-cache-validation`, `--enable-parquet-prefetch`). `--query-timeout-ms` interrupts HTTP and Flight
+metadata cache, Parquet metadata cache and `NO_VALIDATION` for the immutable
+external-file cache by default; each can be flipped
+(`--disable-http-metadata-cache`, `--disable-parquet-metadata-cache`,
+`--enable-cache-validation`). `--query-timeout-ms` interrupts HTTP and Flight
 queries past their deadline (default 30000; 0 disables). Queries run on blocking
 workers with one bounded lifecycle: cancellation is owned from before
 execution through final delivery, the worker clears its interrupt handle
@@ -196,19 +187,14 @@ before the connection returns to the pool (late drops cannot cancel the next
 query), oversized batches drain instead of spinning, and fetch failures
 surface as errors instead of truncated streams. Batches flow through a
 per-stream byte budget (`--flight-stream-mb`, default 32) plus a process-wide
-budget (`--flight-total-mb`, default 128). Native small pages set
-`late_materialization_max_rows=0` to keep the narrow TOP_N on the R-tree path
-instead of a 25M-row scan plus rowid semi-join; DuckLake keeps the default so
-narrow scans fetch page payloads late. Moka coalesces identical HTTP requests and caches HTTP
+budget (`--flight-total-mb`, default 128). Narrow scans fetch page payloads
+late via file/row-number instead of reading geom+properties first. Moka coalesces identical HTTP requests and caches HTTP
 bytes, with a `--cache-mb` budget (default 256 MiB). Set `--cache-mb 0` to
 measure the uncached path. `/metrics` is `no-store` and reports
 `cache_requests` (lookups), `http_requests`, `cache_hits` (fast-path),
 `cache_coalesced` (shared waiters), `cache_computes`, `cache_failures`,
 `cache_evictions`, plus `duck_external_cache_ranges/bytes` and the effective
-`duck_setting_*` storage tuning. For restart-persistent S3 blocks, pass
-`--duck-disk-cache-dir` (opt-in `cache_httpfs` on-disk cache, 512 KiB blocks
-via `--duck-disk-cache-block-kb`); it serves warm restarts with zero S3 GETs
-at ~2x cold-populate read amplification, so it stays off by default. See
+`duck_setting_*` storage tuning. See
 [`docs/nw-europe-10gib.md`](docs/nw-europe-10gib.md) for the benchmarked
 tradeoffs (`just bench-duck-cache`).
 Error responses are always `Cache-Control: no-store` and carry no ETag.
@@ -252,13 +238,12 @@ holding p99 under 100 ms with under 1% rejected requests.
 Pages carry cursor `next` links: `cursor` is an exclusive lower bound on
 feature id and takes precedence over `offset`, so deep pages traverse fewer
 discarded rows than `OFFSET` (verified 3.5x on full-region pages at offset
-50000; DuckDB does not ART-seek the range, the win is the smaller sort
-input). Direct `offset` links keep working.
+50000; the win is the smaller sort input). Direct `offset` links keep working.
 
 ### Replicas
 
-Shards are immutable, so scale past one CPU by running one instance per core
-group against the same local shard file. Each replica keeps its own pool and
+Snapshots are immutable, so scale past one CPU by running one instance per
+core group against the same catalog. Each replica keeps its own pool and
 in-app response cache: budget roughly one `--connections` pool (8 DuckDB
 threads at one thread each) plus `--cache-mb` per instance, and confirm with
 `bench-http` round-robining across replicas versus one instance:
@@ -271,19 +256,26 @@ On the 20k Berlin fixture, loopback, two 4-connection/128 MiB replicas
 served jittered misses at ~720 rps against ~350 rps for one 8-connection
 instance at equal totals.
 
-Reference loopback run on the 5.17 GB / 14.985M-feature Layercake shard:
+Reference loopback run on the 5.17 GB / 14.985M-feature single-file Layercake
+shard (DuckDB 1.5.5 era, before the DuckLake-only rewrite; kept for scale
+context, not quoted as current capacity):
 
 | Workload | Local | `rclone serve s3` |
 |---|---:|---:|
 | First OGC page | 137 ms | 530 ms |
 | Cached OGC pages | 1,435 req/s | 1,385 req/s |
 | Flight-first, 1,000 rows | 237 ms | 255 ms |
-| Cached Flight, 1,000 rows (old 2-cache build) | 966 req/s | 1,007 req/s |
 | Random OGC bbox p99 | 61 ms | 230 ms |
 
 The S3 simulation is loopback and therefore excludes real network latency.
-Full methodology, MVT results, memory, and the query-plan correction are in
-[`docs/s3-benchmark.md`](docs/s3-benchmark.md).
+The DuckLake matrix in [`docs/nw-europe-10gib.md`](docs/nw-europe-10gib.md)
+is the current reference; re-run it on the 2.0 nightly before quoting
+ratios externally.
+
+Verified on the nightly (`v2.0.0-alpha42069`, 20k Berlin lake, loopback
+`rclone serve s3`, `--cache-mb 0`): local and S3 return identical items and
+MVT bytes; miss-path HTTP runs 56 vs 54 rps and 1,000-row Flight runs
+40 vs 41 rps.
 
 These are not universal capacity claims; run the included tools on the target
 CPU, storage, shard size and response shape.

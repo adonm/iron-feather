@@ -5,12 +5,11 @@ use crate::filter;
 use bytes::Bytes;
 use duckdb::{
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
-    AccessMode, Config, Connection,
+    Config, Connection,
 };
 use moka::future::Cache;
 use std::{
     io::Write,
-    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -41,19 +40,9 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-/// Storage behind the pool: a single indexed DuckDB file, or a DuckLake
-/// catalog (small `.ducklake` database plus Parquet data files) without
-/// R-tree or ART indexes. The HTTP surface is identical; only the query
-/// shape changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Backend {
-    Native,
-    Lake,
-}
-
-/// Versioned build metadata written atomically alongside the shard.
-/// Lets servers verify they serve the intended snapshot and lets clients
-/// reason about layout without opening the database.
+/// Storage behind the pool: a DuckLake catalog (small `.ducklake` database
+/// plus Parquet data files) on local disk or S3. The HTTP surface is
+/// identical across locations; only the catalog URL changes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShardManifest {
     pub version: u32,
@@ -98,24 +87,11 @@ pub struct StoreConfig {
     /// versioned shards; avoids a HEAD per range read on repeat access.
     pub http_metadata_cache: bool,
     /// Cache Parquet footers/metadata for repeated reads of the same files.
-    /// Helps DuckLake (many Parquet files, repeated footer parses).
     pub parquet_metadata_cache: bool,
-    /// Reuse HTTP connections across requests (reduces TLS/handshake cost).
-    pub http_connection_cache: bool,
-    /// Prefetch all Parquet files (default off: only remote files prefetch).
-    /// Opt-in; helps wide scans, hurts tiny lookups.
-    pub parquet_prefetch_all: bool,
     /// Skip external-file-cache revalidation (NO_VALIDATION) for remote
     /// shards. Safe only for immutable versioned URLs; avoids HEAD
     /// revalidation on warm buffers.
     pub no_validation: bool,
-    /// Optional on-disk block cache via `cache_httpfs` (persistent across
-    /// restarts, shared by all pool connections). `None` disables.
-    pub disk_cache_dir: Option<String>,
-    /// Block size in bytes for the on-disk cache (tune 64 KiB–1 MiB).
-    pub disk_cache_block_bytes: usize,
-    /// Max parallel sub-requests for cache_httpfs fanout (0 = unlimited).
-    pub disk_cache_fanout: usize,
 }
 
 impl Default for StoreConfig {
@@ -134,12 +110,7 @@ impl Default for StoreConfig {
             flight_total_bytes: FLIGHT_TOTAL_BUDGET,
             http_metadata_cache: true,
             parquet_metadata_cache: true,
-            http_connection_cache: true,
-            parquet_prefetch_all: false,
             no_validation: true,
-            disk_cache_dir: None,
-            disk_cache_block_bytes: 512 * 1024,
-            disk_cache_fanout: 0,
         }
     }
 }
@@ -355,7 +326,6 @@ pub struct CacheSnapshot {
 
 pub struct Store {
     pub collections: Vec<String>,
-    backend: Backend,
     pool: Arc<Mutex<Vec<Connection>>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     /// Present only when bulk is capped below the pool size; `None` leaves
@@ -368,7 +338,6 @@ pub struct Store {
     flight_stream_budget: usize,
     flight_total_budget: usize,
     flight_used: Arc<AtomicUsize>,
-    has_derived: bool,
     #[allow(dead_code)]
     manifest: Option<ShardManifest>,
     http: Cache<String, CachedBody>,
@@ -436,15 +405,9 @@ fn manifest_path_for(location: &str) -> Option<String> {
     Some(format!("{location}.manifest.json"))
 }
 
-fn quote_literal(value: &str) -> String {
-    crate::filter::quote(value)
-}
-
 /// DuckDB storage-layer tuning for remote shards. Built-in caches first:
-/// HTTP metadata, Parquet metadata, connection reuse and (for immutable
-/// versioned URLs) NO_VALIDATION skip revalidation on warm buffers. The
-/// external file cache stays on unless a persistent `cache_httpfs` disk
-/// cache takes over (avoid double-caching the same bytes in RAM twice).
+/// HTTP metadata, Parquet metadata, and (for immutable versioned URLs)
+/// NO_VALIDATION skip revalidation on warm buffers.
 pub(crate) fn apply_remote_tuning(
     conn: &Connection,
     cfg: &StoreConfig,
@@ -456,40 +419,7 @@ pub(crate) fn apply_remote_tuning(
     // httpfs-owned settings fail when the extension isn't loaded (autoload
     // is off), so load it before any SET. Installed in all serve images.
     conn.execute_batch("LOAD httpfs;")?;
-    if let Some(dir) = cfg.disk_cache_dir.as_deref() {
-        if dir.is_empty() {
-            return Err(Error::Invalid("disk cache dir must not be empty".into()));
-        }
-        if cfg.disk_cache_block_bytes == 0 {
-            return Err(Error::Invalid(
-                "disk cache block size must be positive".into(),
-            ));
-        }
-        std::fs::create_dir_all(dir).map_err(|e| Error::Invalid(format!("disk cache dir: {e}")))?;
-        if conn.execute_batch("LOAD cache_httpfs;").is_err() {
-            conn.execute_batch("INSTALL cache_httpfs FROM community; LOAD cache_httpfs;")?;
-        }
-        conn.execute_batch("SET cache_httpfs_type='on_disk';")?;
-        conn.execute_batch(&format!(
-            "SET cache_httpfs_cache_directory={};",
-            quote_literal(dir)
-        ))?;
-        conn.execute_batch(&format!(
-            "SET cache_httpfs_cache_block_size={};",
-            cfg.disk_cache_block_bytes
-        ))?;
-        if cfg.disk_cache_fanout > 0 {
-            conn.execute_batch(&format!(
-                "SET cache_httpfs_max_fanout_subrequest={};",
-                cfg.disk_cache_fanout
-            ))?;
-        }
-        // Single caching layer: disk blocks + OS page cache. Keeping the
-        // in-memory external cache on top would hold the same bytes twice.
-        conn.execute_batch("SET enable_external_file_cache=false;")?;
-    } else {
-        conn.execute_batch("SET enable_external_file_cache=true;")?;
-    }
+    conn.execute_batch("SET enable_external_file_cache=true;")?;
     conn.execute_batch(&format!(
         "SET enable_http_metadata_cache={};",
         cfg.http_metadata_cache
@@ -497,14 +427,6 @@ pub(crate) fn apply_remote_tuning(
     conn.execute_batch(&format!(
         "SET parquet_metadata_cache={};",
         cfg.parquet_metadata_cache
-    ))?;
-    conn.execute_batch(&format!(
-        "SET httpfs_connection_caching={};",
-        cfg.http_connection_cache
-    ))?;
-    conn.execute_batch(&format!(
-        "SET prefetch_all_parquet_files={};",
-        cfg.parquet_prefetch_all
     ))?;
     if cfg.no_validation {
         conn.execute_batch("SET validate_external_file_cache='NO_VALIDATION';")?;
@@ -558,11 +480,6 @@ impl Store {
         // shares the queue like everything else.
         let bulk = (cfg.bulk_limit < cfg.connections)
             .then(|| Arc::new(tokio::sync::Semaphore::new(cfg.bulk_limit)));
-        let backend = if cfg.location.ends_with(".ducklake") {
-            Backend::Lake
-        } else {
-            Backend::Native
-        };
         let stats = Arc::new(CacheStats::default());
         let evictions = stats.clone();
         let remote = ["http://", "https://", "s3://"]
@@ -572,65 +489,42 @@ impl Store {
         if cfg.memory_mb > 0 {
             config = config.max_memory(&format!("{}MiB", cfg.memory_mb))?;
         }
-        let conn = if remote || backend == Backend::Lake {
-            Connection::open_in_memory_with_flags(config)?
-        } else {
-            Connection::open_with_flags(
-                Path::new(&cfg.location),
-                config.access_mode(AccessMode::ReadOnly)?,
-            )?
-        };
-        // Extensions load before the lockdown below; ducklake installs on
-        // demand once, then loads offline like spatial does.
-        if backend == Backend::Lake && conn.execute_batch("LOAD ducklake;").is_err() {
+        let conn = Connection::open_in_memory_with_flags(config)?;
+        // Extensions load first; ducklake installs on demand once, then
+        // loads offline like spatial does.
+        if conn.execute_batch("LOAD ducklake;").is_err() {
             conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
         }
         conn.execute_batch(
             "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; LOAD spatial;",
         )?;
-        // Remote storage tuning before ATTACH so the catalog/DB open and
-        // all later reads use it. Local shards skip this entirely.
-        apply_remote_tuning(&conn, &cfg, remote || backend == Backend::Lake)?;
-        // Native small pages previously planned a 25M-row sequential scan
-        // plus a rowid semi-join next to the R-tree lookup; disabling late
-        // materialization keeps the narrow TOP_N on the index path. DuckLake
-        // keeps the default so narrow scans fetch payloads for page rows
-        // late via file/row-number instead of reading geom+properties first.
-        if backend == Backend::Native {
-            conn.execute_batch("SET late_materialization_max_rows=0;")?;
-        }
-        if backend == Backend::Lake {
-            conn.execute_batch(&format!(
-                "LOAD httpfs; ATTACH {} AS shard (READ_ONLY); USE shard;",
-                crate::filter::quote(&format!("ducklake:{}", cfg.location.trim_end_matches('/')))
-            ))?;
-        } else if remote {
-            conn.execute_batch(&format!(
-                "LOAD httpfs; ATTACH {} AS shard (READ_ONLY); USE shard;",
-                crate::filter::quote(&cfg.location)
-            ))?;
-        }
+        // Remote storage tuning before ATTACH so the catalog open and all
+        // later reads use it. Local shards skip this entirely.
+        apply_remote_tuning(&conn, &cfg, remote)?;
+        conn.execute_batch(&format!(
+            "LOAD httpfs; ATTACH {} AS shard (READ_ONLY); USE shard;",
+            crate::filter::quote(&format!("ducklake:{}", cfg.location.trim_end_matches('/')))
+        ))?;
         // Re-assert after ATTACH: loading httpfs for the attach can reset
         // session-level flags on some builds; idempotent and cheap.
-        apply_remote_tuning(&conn, &cfg, remote || backend == Backend::Lake)?;
+        apply_remote_tuning(&conn, &cfg, remote)?;
         // DuckLake resolves Parquet data files at query time through regular
-        // file access, which this lockdown would deny; all SQL here is
-        // server-generated, so the native lockdown stays as defense in depth.
-        if backend == Backend::Native {
-            conn.execute_batch("SET enable_external_access=false;")?;
-        }
+        // file access, which an external-access lockdown would deny; all SQL
+        // here is server-generated.
         let _ = conn
             .prepare(
                 "SELECT id, layer, source_id, ST_AsWKB(geom), properties::JSON FROM features LIMIT 0",
             )?
             .query([])?;
-        // Derived build-time columns (cx/cy/name) let Flight serve centroids
-        // and names without per-row geometry/JSON work. Older shards without
-        // them keep working through computed fallbacks.
-        let has_derived = conn
-            .prepare("SELECT cx, cy, name FROM features LIMIT 0")
-            .and_then(|mut stmt| stmt.query([]).map(|_| ()))
-            .is_ok();
+        // Build-time derivatives (cx/cy/name) are required: the builder
+        // always writes them so Flight and tiles avoid per-row geometry/JSON
+        // work.
+        conn.prepare("SELECT cx, cy, name FROM features LIMIT 0")?
+            .query([])
+            .map(|_| ())
+            .map_err(|_| {
+                Error::Invalid("shard is missing derived cx/cy/name columns; rebuild".into())
+            })?;
         let collections = conn
             .prepare("SELECT id FROM collections ORDER BY id")?
             .query_map([], |r| r.get::<_, String>(0))?
@@ -648,39 +542,24 @@ impl Store {
             .and_then(|text| serde_json::from_str::<ShardManifest>(&text).ok());
         // Pool connections do NOT inherit httpfs/storage SETs from the
         // opener (verified: try_clone starts from defaults for these
-        // keys), so every connection gets the full tuning + backend setup.
-        // The catalog ATTACH itself lives on the shared DB and is done once
-        // above; clones only switch into it.
-        let remote_tuning = remote || backend == Backend::Lake;
+        // keys), so every connection gets the full tuning. The catalog
+        // ATTACH itself lives on the shared DB and is done once above;
+        // clones only switch into it.
         let mut pool = Vec::with_capacity(cfg.connections);
         for _ in 1..cfg.connections {
             let clone = conn.try_clone()?;
-            apply_remote_tuning(&clone, &cfg, remote_tuning)?;
-            if backend == Backend::Native {
-                clone.execute_batch("SET late_materialization_max_rows=0;")?;
-            }
-            if remote || backend == Backend::Lake {
-                clone.execute_batch("USE shard;")?;
-            }
-            if backend == Backend::Native {
-                clone.execute_batch("SET enable_external_access=false;")?;
-            }
+            apply_remote_tuning(&clone, &cfg, remote)?;
+            clone.execute_batch("USE shard;")?;
             pool.push(clone);
         }
         // Re-assert on the opener too (its ATTACH-time LOAD may have reset
         // per-connection flags after the earlier apply).
-        apply_remote_tuning(&conn, &cfg, remote_tuning)?;
-        if backend == Backend::Native {
-            conn.execute_batch("SET late_materialization_max_rows=0;")?;
-        }
-        if remote || backend == Backend::Lake {
-            // Opener already USEd shard at ATTACH; harmless to re-assert.
-            let _ = conn.execute_batch("USE shard;");
-        }
+        apply_remote_tuning(&conn, &cfg, remote)?;
+        // Opener already USEd shard at ATTACH; harmless to re-assert.
+        let _ = conn.execute_batch("USE shard;");
         pool.push(conn);
         Ok(Self {
             collections,
-            backend,
             pool: Arc::new(Mutex::new(pool)),
             semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.connections)),
             bulk,
@@ -691,7 +570,6 @@ impl Store {
             flight_stream_budget: cfg.flight_stream_bytes,
             flight_total_budget: cfg.flight_total_bytes,
             flight_used: Arc::new(AtomicUsize::new(0)),
-            has_derived,
             manifest,
             http: Cache::builder()
                 .max_capacity(cfg.cache_bytes)
@@ -751,9 +629,10 @@ impl Store {
                 "enable_external_file_cache",
                 "enable_http_metadata_cache",
                 "parquet_metadata_cache",
-                "httpfs_connection_caching",
-                "prefetch_all_parquet_files",
                 "validate_external_file_cache",
+                "external_file_cache_remote_block_size",
+                "async_threads",
+                "threads",
                 "memory_limit",
             ] {
                 let value: Result<String, _> = conn.query_row(
@@ -779,39 +658,28 @@ impl Store {
         }
     }
 
-    pub fn is_lake(&self) -> bool {
-        self.backend == Backend::Lake
-    }
-
-    #[allow(dead_code)]
-    pub fn has_derived(&self) -> bool {
-        self.has_derived
-    }
-
     #[allow(dead_code)]
     pub fn manifest(&self) -> Option<&ShardManifest> {
         self.manifest.as_ref()
     }
 
-    /// Precomputed centroid/name fragments when the shard was built with
-    /// derived columns; otherwise the equivalent computed expressions.
+    /// Precomputed centroid/name fragments: the builder always writes the
+    /// derived cx/cy/name columns, so Flight serves them without per-row
+    /// geometry/JSON work.
     pub fn derived_or(&self, column: &str) -> &'static str {
         match column {
-            "x" if self.has_derived => "cx AS x",
-            "x" => "ST_X(ST_Centroid(geom)) AS x",
-            "y" if self.has_derived => "cy AS y",
-            "y" => "ST_Y(ST_Centroid(geom)) AS y",
-            "name" if self.has_derived => "name AS name",
-            "name" => "coalesce(json_extract_string(properties, '$.name'), json_extract_string(properties, '$.tags.name')) AS name",
+            "x" => "cx AS x",
+            "y" => "cy AS y",
+            "name" => "name AS name",
             _ => "",
         }
     }
 
-    /// DuckLake predicate: the shared lineage filter plus explicit bbox-column
-    /// overlap for Parquet statistics pruning, plus an interior fast path.
-    /// Fully contained bboxes skip exact geometry work; boundary candidates
-    /// still go through `ST_Intersects`, which decides every row.
-    pub fn lake_predicate(collection: &str, bounds: Option<[f64; 4]>, sources: &[i64]) -> String {
+    /// Shared lineage filter plus explicit bbox-column overlap for Parquet
+    /// statistics pruning, plus an interior fast path. Fully contained
+    /// bboxes skip exact geometry work; boundary candidates still go through
+    /// `ST_Intersects`, which decides every row.
+    pub fn predicate(collection: &str, bounds: Option<[f64; 4]>, sources: &[i64]) -> String {
         let base = filter::predicate(collection, None, sources);
         match bounds {
             None => base,
@@ -1001,55 +869,14 @@ impl Store {
         .await
     }
 
-    /// Fetch candidate IDs using narrow columns, then payloads through the
-    /// single-column ART index. This avoids a wide base-table scan, which is
-    /// especially important for remotely attached database files.
-    /// Flight results are never cached: every request runs its two queries.
+    /// Single predicate-preserving Arrow query (see [`Store::predicate`]);
+    /// limit/offset page the scan. Page first, convert second: geometry and
+    /// JSON projections run only over the selected page instead of every
+    /// scanned row.
+    /// Flight results are never cached: every request runs its query.
     /// When bulk is capped, extra bulk queries fail fast instead of occupying
     /// shared queue slots, reserving the rest of the pool for interactive use.
     pub async fn arrow(
-        &self,
-        candidate_sql: Option<String>,
-        projection: String,
-    ) -> Result<ArrowResult, Error> {
-        let bulk = self.acquire_bulk()?;
-        self.run_class(WorkClass::Interactive, move |conn| {
-            let _held = bulk;
-            let ids = match candidate_sql {
-                Some(sql) => conn
-                    .prepare(&sql)?
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?,
-                None => vec![],
-            };
-            let predicate = if ids.is_empty() {
-                "FALSE".to_string()
-            } else {
-                format!(
-                    "id IN ({})",
-                    ids.iter()
-                        .map(|id| crate::filter::quote(id))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-            };
-            let sql = format!("SELECT {projection} FROM features WHERE {predicate} ORDER BY id");
-            let mut stmt = conn.prepare(&sql)?;
-            let result = stmt.stream_arrow([])?;
-            Ok(ArrowResult {
-                schema: result.get_schema(),
-                batches: result.collect(),
-            })
-        })
-        .await
-    }
-
-    /// Single predicate-preserving Arrow query for DuckLake, which has no
-    /// ART index for the two-step fetch. The caller supplies the full
-    /// WHERE clause (see `lake_predicate`); limit/offset page the scan.
-    /// Page first, convert second: geometry and JSON projections run only
-    /// over the selected page instead of every scanned row.
-    pub async fn arrow_lake(
         &self,
         predicate: String,
         projection: String,
@@ -1057,20 +884,11 @@ impl Store {
         offset: u32,
     ) -> Result<ArrowResult, Error> {
         let bulk = self.acquire_bulk()?;
-        let inner = if self.has_derived {
-            "id, geom, properties, source_id, cx, cy, name"
-        } else {
-            "id, geom, properties, source_id"
-        };
-        let projection = if self.has_derived {
-            self.rewrite_lake_projection(&projection)
-        } else {
-            projection
-        };
+        let projection = Self::rewrite_projection(&projection);
         self.run_class(WorkClass::Interactive, move |conn| {
             let _held = bulk;
             let sql = format!(
-                "SELECT {projection} FROM (SELECT {inner} FROM features \
+                "SELECT {projection} FROM (SELECT id, geom, properties, source_id, cx, cy, name FROM features \
                  WHERE {predicate} ORDER BY id LIMIT {limit} OFFSET {offset}) AS page ORDER BY page.id"
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -1083,7 +901,7 @@ impl Store {
         .await
     }
 
-    /// One bounded streaming lifecycle for both backends. The worker owns
+    /// One bounded streaming lifecycle. The worker owns
     /// its checkout and bulk permit until it exits; the guard owns
     /// cancellation from before execution through final delivery.
     async fn stream_sql(&self, sql: String) -> Result<FlightBatches, Error> {
@@ -1182,73 +1000,25 @@ impl Store {
     /// large results do not buffer fully before the first batch. Dropping the
     /// response guard interrupts the query; a query-timeout task interrupts
     /// runaway scans. Normal completion clears the handle before the
-    /// connection is reused.
+    /// connection is reused. One predicate-preserving scan streams page
+    /// rows; expensive projections run only over the page.
     pub async fn arrow_stream(
-        &self,
-        candidate_sql: Option<String>,
-        projection: String,
-    ) -> Result<FlightBatches, Error> {
-        // Resolve candidates first under the same bulk + timeout lifecycle,
-        // then stream the indexed payload fetch. Two short lifecycles keep
-        // cancellation precise instead of holding one checkout across both.
-        let ids = match candidate_sql {
-            Some(sql) => {
-                let bulk = self.acquire_bulk()?;
-                self.run_class(WorkClass::Interactive, move |conn| {
-                    let _held = bulk;
-                    Ok(conn
-                        .prepare(&sql)?
-                        .query_map([], |row| row.get::<_, String>(0))?
-                        .collect::<Result<Vec<_>, _>>()?)
-                })
-                .await?
-            }
-            None => vec![],
-        };
-        let predicate = if ids.is_empty() {
-            "FALSE".to_string()
-        } else {
-            format!(
-                "id IN ({})",
-                ids.iter()
-                    .map(|id| crate::filter::quote(id))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        };
-        self.stream_sql(format!(
-            "SELECT {projection} FROM features WHERE {predicate} ORDER BY id"
-        ))
-        .await
-    }
-
-    /// Incremental DuckLake Flight payloads: one predicate-preserving scan
-    /// streams page rows; expensive projections run only over the page.
-    pub async fn arrow_lake_stream(
         &self,
         predicate: String,
         projection: String,
         limit: u32,
         offset: u32,
     ) -> Result<FlightBatches, Error> {
-        // Rewrite the projection to use build-time derivatives when present.
-        let projection = self.rewrite_lake_projection(&projection);
-        let inner = if self.has_derived {
-            "id, geom, properties, source_id, cx, cy, name"
-        } else {
-            "id, geom, properties, source_id"
-        };
+        // Rewrite the projection to use build-time derivatives.
+        let projection = Self::rewrite_projection(&projection);
         let sql = format!(
-            "SELECT {projection} FROM (SELECT {inner} FROM features \
+            "SELECT {projection} FROM (SELECT id, geom, properties, source_id, cx, cy, name FROM features \
              WHERE {predicate} ORDER BY id LIMIT {limit} OFFSET {offset}) AS page ORDER BY page.id"
         );
         self.stream_sql(sql).await
     }
 
-    fn rewrite_lake_projection(&self, projection: &str) -> String {
-        if !self.has_derived {
-            return projection.to_string();
-        }
+    fn rewrite_projection(projection: &str) -> String {
         projection
             .replace(
                 "ST_X(ST_Centroid(geom)) AS x",

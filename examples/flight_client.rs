@@ -1,7 +1,7 @@
 //! Minimal Flight client reading the same shard as the OGC API.
 //!
 //! ```sh
-//! just run fixtures/osm.duckdb # in another shell
+//! just run fixtures/osm.ducklake # in another shell
 //! cargo run --locked --example flight_client
 //! ```
 
