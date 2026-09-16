@@ -119,6 +119,28 @@ bench-matrix base="http://127.0.0.1:3000" dir="workloads/nw-europe" passes="2":
     cargo run --locked --release --example http_bench -- --base "$base" --concurrency 4 --passes 1 --warmup-secs 0 --workload "$wdir/broad.txt"
     cargo run --locked --release --example http_bench -- --base "$base" --concurrency 4 --passes 1 --warmup-secs 0 --workload "$wdir/deep.txt"
 
+# DuckDB storage-cache A/B: fresh process per case, 1 cold + 1 warm urban
+# pass over loopback rclone S3. Compares stock settings against the tuned
+# defaults and the opt-in persistent disk cache. See docs/nw-europe-10gib.md.
+bench-duck-cache shard="http://127.0.0.1:19000/catalog/nw-europe-lake.ducklake":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bench() {
+      echo "=== $1 ==="
+      cargo run --locked --release -- serve --shard {{quote(shard)}} --listen 127.0.0.1:3000 --flight-listen 127.0.0.1:50051 --connections 8 --cache-mb 0 ${@:2} &
+      SRV=$!
+      for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:3000/healthz && break; sleep 1; done
+      curl -s http://127.0.0.1:3000/metrics | grep duck_
+      cargo run --locked --release --example http_bench -- --base http://127.0.0.1:3000 --concurrency 8 --passes 1 --warmup-secs 0 --workload workloads/nw-europe/urban.txt
+      cargo run --locked --release --example http_bench -- --base http://127.0.0.1:3000 --concurrency 8 --passes 1 --warmup-secs 0 --workload workloads/nw-europe/urban.txt
+      curl -s http://127.0.0.1:3000/metrics | grep -E "duck_external|http_requests"
+      kill $SRV; wait $SRV 2>/dev/null || true
+    }
+    bench "stock (all caches off)" --disable-http-metadata-cache --disable-parquet-metadata-cache --disable-connection-cache --enable-cache-validation --memory-mb 0
+    bench "tuned defaults (4 GiB)" --memory-mb 4096
+    rm -rf /tmp/opencode/duck-disk-bench
+    bench "persistent disk cache" --memory-mb 4096 --duck-disk-cache-dir /tmp/opencode/duck-disk-bench
+
 run shard="fixtures/osm.duckdb" *args: setup-duckdb
     cargo run --locked --release -- serve --shard {{quote(shard)}} {{args}}
 

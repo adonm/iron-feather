@@ -182,7 +182,13 @@ connections for interactive OGC under bulk load. Heavy HTTP pages
 lane. `--threads` sets shared DuckDB threads for the whole process
 (default 1; keep at 1 for many small concurrent queries, raise only with
 fewer connections for bulk) and `--memory-mb` caps shared DuckDB memory in
-MiB (default 0, unlimited). `--query-timeout-ms` interrupts HTTP and Flight
+MiB (default 4096, sized for the ~10 GB shard urban working set; 0 leaves
+DuckDB's unbounded default). Remote shards also enable DuckDB's HTTP
+metadata cache, Parquet metadata cache, HTTP connection reuse and
+`NO_VALIDATION` for the immutable external-file cache by default; each can
+be flipped (`--disable-http-metadata-cache`,
+`--disable-parquet-metadata-cache`, `--disable-connection-cache`,
+`--enable-cache-validation`, `--enable-parquet-prefetch`). `--query-timeout-ms` interrupts HTTP and Flight
 queries past their deadline (default 30000; 0 disables). Queries run on blocking
 workers with one bounded lifecycle: cancellation is owned from before
 execution through final delivery, the worker clears its interrupt handle
@@ -197,8 +203,14 @@ narrow scans fetch page payloads late. Moka coalesces identical HTTP requests an
 bytes, with a `--cache-mb` budget (default 256 MiB). Set `--cache-mb 0` to
 measure the uncached path. `/metrics` is `no-store` and reports
 `cache_requests` (lookups), `http_requests`, `cache_hits` (fast-path),
-`cache_coalesced` (shared waiters), `cache_computes`, `cache_failures` and
-`cache_evictions`; hit rate over lookups is `(hits + coalesced) / requests`.
+`cache_coalesced` (shared waiters), `cache_computes`, `cache_failures`,
+`cache_evictions`, plus `duck_external_cache_ranges/bytes` and the effective
+`duck_setting_*` storage tuning. For restart-persistent S3 blocks, pass
+`--duck-disk-cache-dir` (opt-in `cache_httpfs` on-disk cache, 512 KiB blocks
+via `--duck-disk-cache-block-kb`); it serves warm restarts with zero S3 GETs
+at ~2x cold-populate read amplification, so it stays off by default. See
+[`docs/nw-europe-10gib.md`](docs/nw-europe-10gib.md) for the benchmarked
+tradeoffs (`just bench-duck-cache`).
 Error responses are always `Cache-Control: no-store` and carry no ETag.
 
 GeoJSON embeds DuckDB's geometry/properties text without a Rust-side

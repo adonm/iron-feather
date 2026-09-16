@@ -86,13 +86,36 @@ pub struct StoreConfig {
     pub bulk_limit: usize,
     /// Shared DuckDB threads for the whole process (not per connection).
     pub threads: i64,
-    /// Shared DuckDB memory budget in MiB. 0 leaves DuckDB's default.
+    /// Shared DuckDB memory budget in MiB. 0 leaves DuckDB's default
+    /// (unbounded); 4096 holds the ~10 GB shard urban working set.
     pub memory_mb: u64,
     pub query_timeout: Duration,
     /// Per-stream Flight buffer in bytes.
     pub flight_stream_bytes: usize,
     /// Process-wide Flight buffer in bytes across all streams.
     pub flight_total_bytes: usize,
+    /// Cache HTTP object metadata (HEAD/ETag) globally. Safe for immutable
+    /// versioned shards; avoids a HEAD per range read on repeat access.
+    pub http_metadata_cache: bool,
+    /// Cache Parquet footers/metadata for repeated reads of the same files.
+    /// Helps DuckLake (many Parquet files, repeated footer parses).
+    pub parquet_metadata_cache: bool,
+    /// Reuse HTTP connections across requests (reduces TLS/handshake cost).
+    pub http_connection_cache: bool,
+    /// Prefetch all Parquet files (default off: only remote files prefetch).
+    /// Opt-in; helps wide scans, hurts tiny lookups.
+    pub parquet_prefetch_all: bool,
+    /// Skip external-file-cache revalidation (NO_VALIDATION) for remote
+    /// shards. Safe only for immutable versioned URLs; avoids HEAD
+    /// revalidation on warm buffers.
+    pub no_validation: bool,
+    /// Optional on-disk block cache via `cache_httpfs` (persistent across
+    /// restarts, shared by all pool connections). `None` disables.
+    pub disk_cache_dir: Option<String>,
+    /// Block size in bytes for the on-disk cache (tune 64 KiB–1 MiB).
+    pub disk_cache_block_bytes: usize,
+    /// Max parallel sub-requests for cache_httpfs fanout (0 = unlimited).
+    pub disk_cache_fanout: usize,
 }
 
 impl Default for StoreConfig {
@@ -105,12 +128,27 @@ impl Default for StoreConfig {
             max_wait: Duration::from_millis(250),
             bulk_limit: 8,
             threads: 1,
-            memory_mb: 0,
+            memory_mb: 4096,
             query_timeout: Duration::from_millis(30_000),
             flight_stream_bytes: FLIGHT_BYTE_BUDGET,
             flight_total_bytes: FLIGHT_TOTAL_BUDGET,
+            http_metadata_cache: true,
+            parquet_metadata_cache: true,
+            http_connection_cache: true,
+            parquet_prefetch_all: false,
+            no_validation: true,
+            disk_cache_dir: None,
+            disk_cache_block_bytes: 512 * 1024,
+            disk_cache_fanout: 0,
         }
     }
+}
+
+/// Point-in-time DuckDB storage-cache occupancy (best-effort; 0 on error).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DuckCacheStats {
+    pub ranges: u64,
+    pub bytes: u64,
 }
 
 pub struct ArrowResult {
@@ -398,6 +436,84 @@ fn manifest_path_for(location: &str) -> Option<String> {
     Some(format!("{location}.manifest.json"))
 }
 
+fn quote_literal(value: &str) -> String {
+    crate::filter::quote(value)
+}
+
+/// DuckDB storage-layer tuning for remote shards. Built-in caches first:
+/// HTTP metadata, Parquet metadata, connection reuse and (for immutable
+/// versioned URLs) NO_VALIDATION skip revalidation on warm buffers. The
+/// external file cache stays on unless a persistent `cache_httpfs` disk
+/// cache takes over (avoid double-caching the same bytes in RAM twice).
+pub(crate) fn apply_remote_tuning(
+    conn: &Connection,
+    cfg: &StoreConfig,
+    remote: bool,
+) -> Result<(), Error> {
+    if !remote {
+        return Ok(());
+    }
+    // httpfs-owned settings fail when the extension isn't loaded (autoload
+    // is off), so load it before any SET. Installed in all serve images.
+    conn.execute_batch("LOAD httpfs;")?;
+    if let Some(dir) = cfg.disk_cache_dir.as_deref() {
+        if dir.is_empty() {
+            return Err(Error::Invalid("disk cache dir must not be empty".into()));
+        }
+        if cfg.disk_cache_block_bytes == 0 {
+            return Err(Error::Invalid(
+                "disk cache block size must be positive".into(),
+            ));
+        }
+        std::fs::create_dir_all(dir).map_err(|e| Error::Invalid(format!("disk cache dir: {e}")))?;
+        if conn.execute_batch("LOAD cache_httpfs;").is_err() {
+            conn.execute_batch("INSTALL cache_httpfs FROM community; LOAD cache_httpfs;")?;
+        }
+        conn.execute_batch("SET cache_httpfs_type='on_disk';")?;
+        conn.execute_batch(&format!(
+            "SET cache_httpfs_cache_directory={};",
+            quote_literal(dir)
+        ))?;
+        conn.execute_batch(&format!(
+            "SET cache_httpfs_cache_block_size={};",
+            cfg.disk_cache_block_bytes
+        ))?;
+        if cfg.disk_cache_fanout > 0 {
+            conn.execute_batch(&format!(
+                "SET cache_httpfs_max_fanout_subrequest={};",
+                cfg.disk_cache_fanout
+            ))?;
+        }
+        // Single caching layer: disk blocks + OS page cache. Keeping the
+        // in-memory external cache on top would hold the same bytes twice.
+        conn.execute_batch("SET enable_external_file_cache=false;")?;
+    } else {
+        conn.execute_batch("SET enable_external_file_cache=true;")?;
+    }
+    conn.execute_batch(&format!(
+        "SET enable_http_metadata_cache={};",
+        cfg.http_metadata_cache
+    ))?;
+    conn.execute_batch(&format!(
+        "SET parquet_metadata_cache={};",
+        cfg.parquet_metadata_cache
+    ))?;
+    conn.execute_batch(&format!(
+        "SET httpfs_connection_caching={};",
+        cfg.http_connection_cache
+    ))?;
+    conn.execute_batch(&format!(
+        "SET prefetch_all_parquet_files={};",
+        cfg.parquet_prefetch_all
+    ))?;
+    if cfg.no_validation {
+        conn.execute_batch("SET validate_external_file_cache='NO_VALIDATION';")?;
+    } else {
+        conn.execute_batch("SET validate_external_file_cache='VALIDATE_ALL';")?;
+    }
+    Ok(())
+}
+
 impl Store {
     #[allow(clippy::too_many_arguments)]
     #[allow(dead_code)]
@@ -472,6 +588,9 @@ impl Store {
         conn.execute_batch(
             "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; LOAD spatial;",
         )?;
+        // Remote storage tuning before ATTACH so the catalog/DB open and
+        // all later reads use it. Local shards skip this entirely.
+        apply_remote_tuning(&conn, &cfg, remote || backend == Backend::Lake)?;
         // Native small pages previously planned a 25M-row sequential scan
         // plus a rowid semi-join next to the R-tree lookup; disabling late
         // materialization keeps the narrow TOP_N on the index path. DuckLake
@@ -491,6 +610,9 @@ impl Store {
                 crate::filter::quote(&cfg.location)
             ))?;
         }
+        // Re-assert after ATTACH: loading httpfs for the attach can reset
+        // session-level flags on some builds; idempotent and cheap.
+        apply_remote_tuning(&conn, &cfg, remote || backend == Backend::Lake)?;
         // DuckLake resolves Parquet data files at query time through regular
         // file access, which this lockdown would deny; all SQL here is
         // server-generated, so the native lockdown stays as defense in depth.
@@ -524,9 +646,16 @@ impl Store {
         let manifest = manifest_path_for(&cfg.location)
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| serde_json::from_str::<ShardManifest>(&text).ok());
+        // Pool connections do NOT inherit httpfs/storage SETs from the
+        // opener (verified: try_clone starts from defaults for these
+        // keys), so every connection gets the full tuning + backend setup.
+        // The catalog ATTACH itself lives on the shared DB and is done once
+        // above; clones only switch into it.
+        let remote_tuning = remote || backend == Backend::Lake;
         let mut pool = Vec::with_capacity(cfg.connections);
         for _ in 1..cfg.connections {
             let clone = conn.try_clone()?;
+            apply_remote_tuning(&clone, &cfg, remote_tuning)?;
             if backend == Backend::Native {
                 clone.execute_batch("SET late_materialization_max_rows=0;")?;
             }
@@ -537,6 +666,16 @@ impl Store {
                 clone.execute_batch("SET enable_external_access=false;")?;
             }
             pool.push(clone);
+        }
+        // Re-assert on the opener too (its ATTACH-time LOAD may have reset
+        // per-connection flags after the earlier apply).
+        apply_remote_tuning(&conn, &cfg, remote_tuning)?;
+        if backend == Backend::Native {
+            conn.execute_batch("SET late_materialization_max_rows=0;")?;
+        }
+        if remote || backend == Backend::Lake {
+            // Opener already USEd shard at ATTACH; harmless to re-assert.
+            let _ = conn.execute_batch("USE shard;");
         }
         pool.push(conn);
         Ok(Self {
@@ -580,6 +719,56 @@ impl Store {
             failures: self.stats.failures.load(Ordering::Relaxed),
             evictions: self.stats.evictions.load(Ordering::Relaxed),
         }
+    }
+
+    /// Best-effort DuckDB external-file-cache occupancy. Queries one pooled
+    /// connection; returns zeroes if the pool is busy or the function is
+    /// unavailable (e.g. local-only tests). Never fails `/metrics`.
+    pub async fn duck_cache_stats(&self) -> DuckCacheStats {
+        self.run(|conn| {
+            let (ranges, bytes): (i64, Option<i64>) = conn
+                .query_row(
+                    "SELECT count(*), sum(nr_bytes) FROM duckdb_external_file_cache()",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|_| Error::Overloaded)?;
+            Ok(DuckCacheStats {
+                ranges: ranges.max(0) as u64,
+                bytes: bytes.unwrap_or(0).max(0) as u64,
+            })
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Current DuckDB storage-tuning actually in effect (for /metrics and
+    /// bench logs). Reads GLOBAL settings on a pooled connection.
+    pub async fn duck_tuning(&self) -> Vec<(String, String)> {
+        self.run(|conn| {
+            let mut out = Vec::new();
+            for key in [
+                "enable_external_file_cache",
+                "enable_http_metadata_cache",
+                "parquet_metadata_cache",
+                "httpfs_connection_caching",
+                "prefetch_all_parquet_files",
+                "validate_external_file_cache",
+                "memory_limit",
+            ] {
+                let value: Result<String, _> = conn.query_row(
+                    &format!("SELECT value FROM duckdb_settings() WHERE name='{key}'"),
+                    [],
+                    |r| r.get(0),
+                );
+                if let Ok(value) = value {
+                    out.push((key.to_string(), value));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .unwrap_or_default()
     }
 
     pub fn collection(&self, id: &str) -> Result<(), Error> {

@@ -1554,3 +1554,86 @@ fn manifest_round_trips_through_serde() {
     assert_eq!(back.rows, 7);
     assert_eq!(back.schema_version, 2);
 }
+
+#[test]
+fn duck_tuning_defaults_are_pragmatic() {
+    use crate::store::StoreConfig;
+    let cfg = StoreConfig::default();
+    assert!(cfg.http_metadata_cache);
+    assert!(cfg.parquet_metadata_cache);
+    assert!(cfg.http_connection_cache);
+    assert!(!cfg.parquet_prefetch_all);
+    assert!(cfg.no_validation);
+    assert!(cfg.disk_cache_dir.is_none());
+}
+
+#[tokio::test]
+async fn duck_tuning_flags_reach_duckdb_settings() {
+    use crate::store::StoreConfig;
+    let fixture = Fixture::new(1);
+    // Local open leaves defaults alone; tuning query still works.
+    let tuning = fixture.store.duck_tuning().await;
+    assert!(!tuning.is_empty());
+    let stats = fixture.store.duck_cache_stats().await;
+    // Local file: external cache table exists, may be empty.
+    assert_eq!(stats.ranges, 0);
+
+    // Remote tuning applies to a scratch in-memory DB (no ATTACH needed to
+    // verify the SETs bind on this DuckDB version).
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("LOAD httpfs;").unwrap();
+    let cfg = StoreConfig {
+        http_metadata_cache: true,
+        parquet_metadata_cache: true,
+        http_connection_cache: true,
+        parquet_prefetch_all: false,
+        no_validation: true,
+        ..StoreConfig::default()
+    };
+    crate::store::apply_remote_tuning(&conn, &cfg, true).unwrap();
+    // try_clone inheritance for these keys is unreliable across builds
+    // (observed both inherited and default), so the pool tunes every
+    // connection individually.
+    let clone = conn.try_clone().unwrap();
+    crate::store::apply_remote_tuning(&clone, &cfg, true).unwrap();
+    let get_clone = |name: &str| {
+        clone
+            .query_row(
+                &format!("SELECT value FROM duckdb_settings() WHERE name='{name}'"),
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    let get = |name: &str| {
+        conn.query_row(
+            &format!("SELECT value FROM duckdb_settings() WHERE name='{name}'"),
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(get("enable_http_metadata_cache"), "true");
+    assert_eq!(get("parquet_metadata_cache"), "true");
+    assert_eq!(get("httpfs_connection_caching"), "true");
+    assert_eq!(get("validate_external_file_cache"), "NO_VALIDATION");
+    assert_eq!(get_clone("enable_http_metadata_cache"), "true");
+}
+
+#[tokio::test]
+async fn metrics_exposes_duck_cache_occupancy() {
+    let fixture = Fixture::new(1);
+    let client = TestClient::new(api::routes(fixture.store));
+    let text = client
+        .get("/metrics")
+        .send()
+        .await
+        .0
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(text.contains("duck_external_cache_ranges"));
+    assert!(text.contains("duck_external_cache_bytes"));
+    assert!(text.contains("duck_setting_enable_http_metadata_cache"));
+}

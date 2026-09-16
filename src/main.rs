@@ -53,8 +53,9 @@ enum Command {
         /// bulk.
         #[arg(long, default_value_t = 1)]
         threads: i64,
-        /// Shared DuckDB memory budget in MiB. 0 leaves DuckDB's default.
-        #[arg(long, default_value_t = 0)]
+        /// Shared DuckDB memory budget in MiB. 0 leaves DuckDB's default
+        /// (unbounded); 4096 holds the ~10 GB shard urban working set.
+        #[arg(long, default_value_t = 4096)]
         memory_mb: u64,
         /// Query execution deadline in ms for HTTP and Flight. 0 disables;
         /// exceeded queries are interrupted and surface as backend failures.
@@ -67,6 +68,33 @@ enum Command {
         /// Process-wide Flight buffer in MiB across all streams.
         #[arg(long, default_value_t = 128)]
         flight_total_mb: u64,
+        /// Disable DuckDB HTTP metadata cache (default: enabled for remote).
+        #[arg(long)]
+        disable_http_metadata_cache: bool,
+        /// Disable DuckDB Parquet metadata cache (default: enabled).
+        #[arg(long)]
+        disable_parquet_metadata_cache: bool,
+        /// Disable HTTP connection reuse (default: enabled).
+        #[arg(long)]
+        disable_connection_cache: bool,
+        /// Enable prefetching for all Parquet files (default: remote-only).
+        /// Opt-in; helps wide scans, hurts tiny lookups.
+        #[arg(long)]
+        enable_parquet_prefetch: bool,
+        /// Re-enable external-file-cache validation (default: NO_VALIDATION
+        /// for remote immutable shards). Only set for mutable URLs.
+        #[arg(long)]
+        enable_cache_validation: bool,
+        /// Persistent on-disk block cache dir via cache_httpfs (opt-in).
+        /// Empty/absent disables; survives restarts, shared by all conns.
+        #[arg(long)]
+        duck_disk_cache_dir: Option<String>,
+        /// Block size in KiB for the on-disk cache (64–1024).
+        #[arg(long, default_value_t = 512)]
+        duck_disk_cache_block_kb: u64,
+        /// Max parallel sub-requests for on-disk cache fanout (0=unlimited).
+        #[arg(long, default_value_t = 0)]
+        duck_disk_cache_fanout: u64,
     },
 }
 
@@ -93,12 +121,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             query_timeout_ms,
             flight_stream_mb,
             flight_total_mb,
+            disable_http_metadata_cache,
+            disable_parquet_metadata_cache,
+            disable_connection_cache,
+            enable_parquet_prefetch,
+            enable_cache_validation,
+            duck_disk_cache_dir,
+            duck_disk_cache_block_kb,
+            duck_disk_cache_fanout,
         } => {
             let bulk_limit = if flight_concurrency == 0 {
                 connections.into()
             } else {
                 flight_concurrency.into()
             };
+            let block_bytes = (duck_disk_cache_block_kb.clamp(16, 4096) * 1024) as usize;
             let store = Arc::new(store::Store::open_config(store::StoreConfig {
                 location: shard.clone(),
                 connections: connections.into(),
@@ -111,6 +148,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 query_timeout: std::time::Duration::from_millis(query_timeout_ms),
                 flight_stream_bytes: (flight_stream_mb.max(1) * 1024 * 1024) as usize,
                 flight_total_bytes: (flight_total_mb.max(1) * 1024 * 1024) as usize,
+                http_metadata_cache: !disable_http_metadata_cache,
+                parquet_metadata_cache: !disable_parquet_metadata_cache,
+                http_connection_cache: !disable_connection_cache,
+                parquet_prefetch_all: enable_parquet_prefetch,
+                no_validation: !enable_cache_validation,
+                disk_cache_dir: duck_disk_cache_dir.filter(|s| !s.is_empty()),
+                disk_cache_block_bytes: block_bytes,
+                disk_cache_fanout: duck_disk_cache_fanout as usize,
             })?);
             tracing::info!(%listen, %flight_listen, %shard, "serving shard");
             let http = poem::Server::new(poem::listener::TcpListener::bind(listen))

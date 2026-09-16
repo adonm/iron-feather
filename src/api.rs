@@ -243,29 +243,35 @@ fn health(Query(_): Query<NoQuery>) -> &'static str {
 /// with `no-store`: hit rate over lookups is `(hits + coalesced) /
 /// requests`; `http_requests` counts HTTP responses attempted (one request
 /// can cause up to two lookups: gzip then identity); `failures` counts miss
-/// executions that errored and were not cached.
+/// executions that errored and were not cached. `duck_*` lines report the
+/// DuckDB external-file-cache occupancy (ranges/bytes) best-effort.
 #[handler]
-fn metrics(Query(_): Query<NoQuery>, Data(store): Data<&Arc<Store>>) -> Response {
+async fn metrics(Query(_): Query<NoQuery>, Data(store): Data<&Arc<Store>>) -> Response {
     let stats = store.cache_stats();
+    let duck = store.duck_cache_stats().await;
+    let tuning = store.duck_tuning().await;
+    let mut out = format!(
+        "cache_entries {}\ncache_weight_bytes {}\ncache_requests {}\nhttp_requests {}\ncache_hits {}\ncache_coalesced {}\ncache_computes {}\ncache_failures {}\ncache_evictions {}\nduck_external_cache_ranges {}\nduck_external_cache_bytes {}\n",
+        stats.entries,
+        stats.weight_bytes,
+        stats.requests,
+        stats.http_requests,
+        stats.hits,
+        stats.coalesced,
+        stats.computes,
+        stats.failures,
+        stats.evictions,
+        duck.ranges,
+        duck.bytes,
+    );
+    for (key, value) in tuning {
+        out.push_str(&format!("duck_setting_{key} {value}\n"));
+    }
     Response::builder()
         .content_type("text/plain; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::VARY, "Accept, Accept-Encoding, X-Source-Ids")
-        .body(Bytes::from(
-            format!(
-                "cache_entries {}\ncache_weight_bytes {}\ncache_requests {}\nhttp_requests {}\ncache_hits {}\ncache_coalesced {}\ncache_computes {}\ncache_failures {}\ncache_evictions {}\n",
-                stats.entries,
-                stats.weight_bytes,
-                stats.requests,
-                stats.http_requests,
-                stats.hits,
-                stats.coalesced,
-                stats.computes,
-                stats.failures,
-                stats.evictions
-            )
-            .into_bytes(),
-        ))
+        .body(Bytes::from(out.into_bytes()))
 }
 #[handler]
 fn spec(Query(_): Query<NoQuery>) -> Response {
