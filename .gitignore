@@ -7,3 +7,4 @@
 .env
 /.oy
 /workloads
+__pycache__/
