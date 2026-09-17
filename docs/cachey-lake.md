@@ -161,43 +161,48 @@ RSS. The uncached row below predates the direct-S3 flags: re-run it as
 before quoting.
 
 On loopback, fetch cost nearly vanishes and per-query engine work
-dominates: cold Cachey runs ~134 rps / p50 47 ms, warm Cachey ~140-150 rps
-on the mixed Berlin workload. That is not a uniform floor — it is
-query-shape dependent, and most of it is removable without bypassing
-DuckDB. Diagnostic (2026-09-17, identical 20k ids served from local files
-vs Cachey vs a native DuckDB table, threads=1, warm, 100 m window
-returning 2 features):
+dominates. Diagnostic (2026-09-17, identical 20k ids served from local
+files vs Cachey vs a native DuckDB table, threads=1, warm) found two
+compounding causes, both now pulled:
 
-| backend | ids-only | full GeoJSON |
+- DuckLake answered every catalog-table query through a
+  snapshot/delete-filter join over `(filename, file_row_number)` —
+  ~2–3x the bytes and ~2x the time of reading the same Parquet directly
+  (10.2 MB read for a 3.3 KB response; the 1 km/100-feature query planned
+  as a single scan at 5.5 MB while the 100 m/2-feature query took the
+  double-scan join — fewer matches cost more). Serving reads now resolve
+  at startup to a frozen `read_parquet([...])` over the exact files live
+  at the pinned snapshot (`Store::table_from`). Guards fail closed to
+  catalog reads: snapshot-scoped file/schema segments, zero live delete
+  files and inlined deletes/rows, expected builder schema, non-empty file
+  list. Unit tests prove byte-identical pages and delete fallback.
+- The fixture file held a single row group (`row_group 65536` > 20k
+  rows), so `xmin/xmax` zone maps pruned at file granularity only.
+  Row-group default is now 8192 (measured on direct reads: 44 ms at 1
+  group, 28 ms at 3, 22 ms at 10). Row groups did nothing on the DuckLake
+  path (71→76→72 ms across the curve — the join dominated), which is why
+  the bypass came first. Killed ideas, measured: `properties::VARCHAR`
+  cast costs nothing (28 vs 28.5 ms); the ids→full gap is payload-column
+  decode, not conversion.
+
+| backend, warm conc=1 | before | after |
 |---|---|---|
-| DuckLake, local files (server end-to-end) | — | ~72–83 ms |
-| DuckLake, local files (CLI `real`) | 37 ms | 71 ms |
-| DuckLake through warm Cachey (server end-to-end) | — | ~73 ms, 0 new S3 downloads over 64 reqs |
-| native DuckDB table, local file (CLI `real`) | 7 ms | 14 ms |
+| local files, diag mix p50 | ~72 ms | ~29 ms |
+| local files, 100 m / 2-feature shape | ~72 ms | ~25–41 ms |
+| local files, limit=100 shape | ~37 ms | ~15–17 ms |
+| warm Cachey, diag mix p50 | ~73 ms | ~43–58 ms, 0 new S3 downloads over 24 steady-state reqs |
 
 Server assembly/encode is microseconds per the `ogc items render`
 `candidate_us`/`fetch_us` debug split — DuckDB time is the total.
-`EXPLAIN ANALYZE` attributes it to two compounding causes:
-
-- DuckLake reads the file ~2–3x per query: the small-window plan joins
-  the predicate scan against a delete-filter leg over `(filename,
-  file_row_number)` (10.2 MB read for a 3.3 KB response). The same window
-  on the native table reads 262 KB via rowid pushdown.
-- The fixture file holds a single row group (`row_group 65536` > 20k
-  rows), so `xmin/xmax` zone maps prune at file granularity only and
-  every query decodes all 20k geometries (~30 ms scan). Smaller row
-  groups under the existing `grid`/`hilbert` sortkey clustering would let
-  most queries skip most of the file.
-- Plan shape flips with the window: the 1 km/100-feature query plans as
-  a single scan (5.5 MB, ~40 ms) while the 100 m/2-feature query takes
-  the double-scan join (10.2 MB, ~71–83 ms) — fewer matches cost more.
-
-Concurrency 1/4/8 leaves local p50 flat (~86 ms on the diag mix) while
-rps scales 12→45→76: no queueing, latency is per-query work. The old
-2,000-4,500 rps figures measured the removed per-pod app cache on
-repeated URLs, not storage: with it gone, per-unique-request work is
-unchanged by design (it never hit the app cache), and zone-shared Cachey
-is what absorbs repeats across pods.
+Concurrency 1/4/8 leaves local p50 flat while rps scales: no queueing,
+latency is per-query work. Residual floor for a novel 2-feature URL is
+~25 ms (scan + payload decode + ~4 ms planning + server); sub-10 needs
+plan caching (prepared statements), more threads per query, or a shared
+response cache — storage caching cannot close it. The old 2,000-4,500 rps
+figures measured the removed per-pod app cache on repeated URLs, not
+storage: with it gone, per-unique-request work is unchanged by design
+(it never hit the app cache), and zone-shared Cachey is what absorbs
+repeats across pods.
 
 ## Production mapping
 

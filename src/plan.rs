@@ -114,12 +114,13 @@ pub fn is_heavy(limit: u32, pagination: &Pagination, bounds: Option<[f64; 4]>) -
     false
 }
 
-/// Items page SQL (GeoJSON conversion outside the page).
-pub fn items_sql(req: &ItemsRequest, page_where: &str) -> String {
+/// Items page SQL (GeoJSON conversion outside the page). `from` is the
+/// store's frozen serving source (catalog table or file list).
+pub fn items_sql(req: &ItemsRequest, page_where: &str, from: &str) -> String {
     let _ = req;
     format!(
         "SELECT id, ST_AsGeoJSON(geom), properties::VARCHAR FROM \
-         (SELECT id, geom, properties FROM features WHERE {page_where}) AS page \
+         (SELECT id, geom, properties FROM {from} WHERE {page_where}) AS page \
          ORDER BY id"
     )
 }

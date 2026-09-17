@@ -39,8 +39,12 @@ pub struct Build {
     /// Target Parquet file size in MiB.
     #[arg(long, default_value_t = 128)]
     pub file_mb: u64,
-    /// Parquet row-group size in rows.
-    #[arg(long, default_value_t = 65536)]
+    /// Parquet row-group size in rows. Smaller groups sharpen xmin/xmax /
+    /// ymin/ymax zone-map pruning because serving reads resolve to
+    /// `read_parquet` over frozen file lists: 8192 measured ~35% faster
+    /// than 65536 on 20k-row slices (direct reads 44 ms to 28 ms). Larger
+    /// values favor bulk scans with fewer footers.
+    #[arg(long, default_value_t = 8192)]
     pub row_group: u64,
     /// Row clustering for tight per-file bbox statistics: grid (default),
     /// hilbert, or none (preserve source insertion order).

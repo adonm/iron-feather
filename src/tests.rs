@@ -3,6 +3,7 @@
 //! `common`). Larger real-stack coverage (MinIO → Cachey → servers) lives
 //! in tests/stack/ and the 25M-row DuckLake fixture.
 mod common;
+mod file_list;
 mod flight;
 mod materialize;
 mod ogc;

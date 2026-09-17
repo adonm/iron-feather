@@ -108,8 +108,11 @@ zone-independent `s3://` data root and each reader passes `--data-base`
 with its zone's Cachey `/fetch/` prefix, so all storage reads are range
 GETs through the zone-shared page cache (see
 [`docs/cachey-lake.md`](docs/cachey-lake.md)).
-Every pooled connection is switched to the attached catalog; DuckLake resolves
-its Parquet data files at query time, so all SQL remains server-generated.
+Every pooled connection is switched to the attached catalog; serving reads
+resolve at startup to a frozen `read_parquet` file list over the exact
+files live at the pinned snapshot (falling back to the catalog table on
+any doubt), so all SQL remains server-generated and identical rows serve
+without DuckLake's per-query snapshot join.
 
 Spatial queries prune by file/row-group bbox statistics, then run exact
 `ST_Intersects` only on boundary candidates (fully contained bboxes skip it).

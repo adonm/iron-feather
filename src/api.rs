@@ -484,6 +484,7 @@ async fn items(
     // A cursor bounds the id range, so DuckDB starts at the page instead of
     // discarding `offset` leading rows. Offset stays for direct links.
     let limit = query.limit;
+    let from = store.table_from().to_string();
     let query: QueryFn = Box::new(move |conn: &NeoConnection| {
         let selected = std::time::Instant::now();
         let req_owned = normalized.clone();
@@ -493,7 +494,7 @@ async fn items(
         let (page_filter, page_tail) = plan::page_parts(&base_predicate, limit, &pagination);
         // Page first, convert second: the inner scan selects raw columns for
         // the page, the outer converts only those rows to GeoJSON.
-        let sql = plan::items_sql(&req_owned, &format!("{page_filter} {page_tail}"));
+        let sql = plan::items_sql(&req_owned, &format!("{page_filter} {page_tail}"), &from);
         let rows = fetch_rows(conn, &sql)?;
         let (page, has_next, last_id): (Vec<Feature>, bool, Option<String>) = {
             let has_next = rows.len() > limit as usize;
@@ -578,9 +579,10 @@ async fn item(
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(",");
+    let from = store.table_from().to_string();
     let query: QueryFn = Box::new(move |conn: &NeoConnection| {
         let sql = format!(
-            "SELECT {FEATURE_COLUMNS} FROM features WHERE id = {} AND layer = {} AND source_id IN ({sources_sql}) LIMIT 1",
+            "SELECT {FEATURE_COLUMNS} FROM {from} WHERE id = {} AND layer = {} AND source_id IN ({sources_sql}) LIMIT 1",
             filter::quote(&id),
             filter::quote(&collection),
         );

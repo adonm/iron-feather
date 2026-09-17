@@ -351,6 +351,12 @@ pub struct Store {
     /// Pinned DuckLake snapshot this instance serves. Resolved at startup;
     /// both the serving pool and Quack attach at exactly this version.
     pub snapshot: i64,
+    /// FROM clause for every serving read of the user table: either the
+    /// catalog table (`features`) or a startup-frozen
+    /// `read_parquet([...])` over the exact files live at [`Self::snapshot`]
+    /// (see [`resolve_table_source`]). Quack keeps serving the catalog
+    /// table; everything else reads through this clause.
+    table_from: String,
     pool: Arc<Mutex<Vec<NeoConnection>>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     /// Present only when bulk is capped below the pool size; `None` leaves
@@ -459,6 +465,220 @@ pub(crate) fn attach_options(snapshot: Option<i64>, data_path_override: Option<&
 /// Quack instance so both pin the same snapshot.
 pub fn catalog_url(location: &str) -> String {
     format!("ducklake:{}", location.trim_end_matches('/'))
+}
+
+/// DuckLake metadata schema for the serving attach (the alias is always
+/// `shard` on serving connections, so the suffix is fixed).
+const META: &str = "__ducklake_metadata_shard";
+
+/// Builder-schema columns every serving query projects. A catalog whose
+/// features table differs (older/newer builder) stays on catalog reads.
+const EXPECTED_FEATURE_SCHEMA: [(&str, &str); 13] = [
+    ("id", "VARCHAR"),
+    ("layer", "VARCHAR"),
+    ("source_id", "BIGINT"),
+    ("geom", "GEOMETRY"),
+    ("properties", "JSON"),
+    ("sortkey", "BIGINT"),
+    ("xmin", "DOUBLE"),
+    ("ymin", "DOUBLE"),
+    ("xmax", "DOUBLE"),
+    ("ymax", "DOUBLE"),
+    ("cx", "DOUBLE"),
+    ("cy", "DOUBLE"),
+    ("name", "VARCHAR"),
+];
+
+/// Resolve the serving FROM clause (see [`Store::table_from`]). DuckLake
+/// answers every catalog-table query through a snapshot/delete-filter join
+/// over (filename, file_row_number) — measured ~2-3x the bytes and ~2x the
+/// time of reading the same Parquet directly, with per-window plan flips on
+/// top. Our publishes are additive-only (data files never deleted or
+/// rewritten, inlined data flushed, no row deletes), so the live file list
+/// at the pinned snapshot is the whole truth and `read_parquet` over it
+/// serves identical rows without the join. Every guard below fails closed
+/// to catalog reads: a foreign catalog (deletes, inlined rows, evolved
+/// schema, empty table) serves exactly as before, only slower.
+fn resolve_table_source(
+    conn: &NeoConnection,
+    snapshot: i64,
+    data_override: Option<&str>,
+) -> String {
+    match table_source(conn, snapshot, data_override) {
+        Ok(from) => {
+            tracing::info!("serving reads from frozen file list");
+            from
+        }
+        Err(reason) => {
+            tracing::warn!(reason, "serving reads from catalog table");
+            "features".to_string()
+        }
+    }
+}
+
+fn table_source(
+    conn: &NeoConnection,
+    snapshot: i64,
+    data_override: Option<&str>,
+) -> Result<String, String> {
+    let tid = db::int_one(
+        conn,
+        &format!("SELECT table_id FROM {META}.ducklake_table WHERE table_name='features'"),
+    )
+    .map_err(|e| format!("features table id: {e}"))?;
+    let cols = db::text_table(
+        conn,
+        "SELECT column_name, column_type FROM (DESCRIBE shard.features)",
+    )
+    .map_err(|e| format!("features schema: {e}"))?;
+    let got: Vec<(String, String)> = cols
+        .into_iter()
+        .map(|mut row| {
+            let mut cells = row.drain(..);
+            (
+                cells.next().flatten().unwrap_or_default(),
+                cells.next().flatten().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let want: Vec<(String, String)> = EXPECTED_FEATURE_SCHEMA
+        .iter()
+        .map(|(name, ty)| (name.to_string(), ty.to_string()))
+        .collect();
+    if got != want {
+        return Err("features schema differs from builder schema".into());
+    }
+    let files = db::text_table(
+        conn,
+        &format!(
+            "SELECT path, path_is_relative::VARCHAR FROM {META}.ducklake_data_file \
+             WHERE table_id={tid} AND begin_snapshot<={snapshot} \
+             AND (end_snapshot IS NULL OR end_snapshot>{snapshot}) ORDER BY file_order"
+        ),
+    )
+    .map_err(|e| format!("file list: {e}"))?;
+    if files.is_empty() {
+        return Err("no live files at snapshot".into());
+    }
+    // Table files nest under <base>/<schema.path>/<table.path>/ (e.g.
+    // `s3://lake/data/main/features/<file>`); resolve both segments at the
+    // pinned snapshot. Absolute segments are layouts we have not verified:
+    // fail closed.
+    let table = db::text_table(
+        conn,
+        &format!(
+            "SELECT schema_id::VARCHAR, path, path_is_relative::VARCHAR FROM {META}.ducklake_table \
+             WHERE table_id={tid} AND begin_snapshot<={snapshot} \
+             AND (end_snapshot IS NULL OR end_snapshot>{snapshot})"
+        ),
+    )
+    .map_err(|e| format!("table entry: {e}"))?;
+    if table.len() != 1 || table[0].len() != 3 {
+        return Err("table entry is not unique at snapshot".into());
+    }
+    let schema_id: i64 = table[0][0]
+        .as_deref()
+        .unwrap_or_default()
+        .parse()
+        .map_err(|_| "table schema id is not an integer".to_string())?;
+    let table_path = table[0][1].clone().unwrap_or_default();
+    let table_relative = table[0][2].as_deref().unwrap_or_default();
+    let schema = db::text_table(
+        conn,
+        &format!(
+            "SELECT path, path_is_relative::VARCHAR FROM {META}.ducklake_schema \
+             WHERE schema_id={schema_id} AND begin_snapshot<={snapshot} \
+             AND (end_snapshot IS NULL OR end_snapshot>{snapshot})"
+        ),
+    )
+    .map_err(|e| format!("schema entry: {e}"))?;
+    if schema.len() != 1 || schema[0].len() != 2 {
+        return Err("schema entry is not unique at snapshot".into());
+    }
+    let schema_path = schema[0][0].clone().unwrap_or_default();
+    let schema_relative = schema[0][1].as_deref().unwrap_or_default();
+    for segment in [&schema_path, &table_path] {
+        if segment.contains("://") || segment.starts_with('/') {
+            return Err("absolute schema/table segment".into());
+        }
+    }
+    if !table_relative.eq_ignore_ascii_case("true") || !schema_relative.eq_ignore_ascii_case("true")
+    {
+        return Err("non-relative schema/table segment".into());
+    }
+    let slash = |s: &str| {
+        if s.ends_with('/') {
+            s.to_string()
+        } else {
+            format!("{s}/")
+        }
+    };
+    let prefix = format!("{}{}", slash(&schema_path), slash(&table_path));
+    let deletes = db::int_one(
+        conn,
+        &format!(
+            "SELECT count(*) FROM {META}.ducklake_delete_file WHERE table_id={tid} \
+             AND begin_snapshot<={snapshot} AND (end_snapshot IS NULL OR end_snapshot>{snapshot})"
+        ),
+    )
+    .map_err(|e| format!("delete files: {e}"))?;
+    if deletes > 0 {
+        return Err(format!("{deletes} live delete files"));
+    }
+    // The inlined-delete table exists only once a delete was ever written
+    // for the table; absence is clean. Any other error fails closed.
+    match db::int_one(
+        conn,
+        &format!(
+            "SELECT count(*) FROM {META}.ducklake_inlined_delete_{tid} WHERE begin_snapshot<={snapshot}"
+        ),
+    ) {
+        Ok(n) if n > 0 => return Err(format!("{n} inlined deletes")),
+        Ok(_) => {}
+        Err(e) if e.to_string().contains("does not exist") => {}
+        Err(e) => return Err(format!("inlined deletes: {e}")),
+    }
+    let inlined = db::int_one(
+        conn,
+        &format!("SELECT count(*) FROM {META}.ducklake_inlined_data_tables WHERE table_id={tid}"),
+    )
+    .map_err(|e| format!("inlined data: {e}"))?;
+    if inlined > 0 {
+        return Err("inlined data present".into());
+    }
+    let base = match data_override {
+        Some(base) => {
+            if base.ends_with('/') {
+                base.to_string()
+            } else {
+                format!("{base}/")
+            }
+        }
+        None => {
+            let rows = db::text_table(conn, "SELECT data_path FROM ducklake_settings('shard')")
+                .map_err(|e| format!("catalog data path: {e}"))?;
+            rows.into_iter()
+                .next()
+                .and_then(|mut row| row.pop().flatten())
+                .filter(|base| !base.is_empty())
+                .ok_or_else(|| "catalog data path is empty".to_string())?
+        }
+    };
+    let mut urls = Vec::with_capacity(files.len());
+    for mut file in files {
+        let mut cells = file.drain(..);
+        let path = cells.next().flatten().unwrap_or_default();
+        let relative = cells
+            .next()
+            .flatten()
+            .is_some_and(|flag| flag.eq_ignore_ascii_case("true"));
+        urls.push(crate::filter::quote(&if relative {
+            format!("{base}{prefix}{path}")
+        } else {
+            path
+        }));
+    }
+    Ok(format!("read_parquet([{}])", urls.join(",")))
 }
 
 /// Origin (scheme + authority) of an http(s) location, with an optional
@@ -679,6 +899,10 @@ impl Store {
                 "USE shard",
             ],
         )?;
+        // Freeze the serving file list at the pinned snapshot while the
+        // opener still holds the pinned attach. Falls back to the catalog
+        // table on any doubt (see resolve_table_source).
+        let table_from = resolve_table_source(&opener, snapshot, data_override);
         let mut pool = Vec::with_capacity(cfg.connections);
         for _ in 0..cfg.connections {
             let conn = db.connect()?;
@@ -725,6 +949,7 @@ impl Store {
         Ok(Self {
             collections,
             snapshot,
+            table_from,
             pool: Arc::new(Mutex::new(pool)),
             semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.connections)),
             bulk,
@@ -771,6 +996,13 @@ impl Store {
         } else {
             Err(Error::NotFound(id.into()))
         }
+    }
+
+    /// FROM clause for serving reads: the frozen file list when the
+    /// snapshot's guards pass, else the catalog table. Quack does not use
+    /// this (it serves the catalog table directly).
+    pub fn table_from(&self) -> &str {
+        &self.table_from
     }
 
     #[allow(dead_code)]
@@ -945,10 +1177,11 @@ impl Store {
     ) -> Result<ArrowResult, Error> {
         let bulk = self.acquire_bulk()?;
         let projection = Self::rewrite_projection(&projection);
+        let from = self.table_from.clone();
         self.run_class(WorkClass::Interactive, move |conn| {
             let _held = bulk;
             let sql = format!(
-                "SELECT {projection} FROM (SELECT id, geom, properties, source_id, cx, cy, name FROM features \
+                "SELECT {projection} FROM (SELECT id, geom, properties, source_id, cx, cy, name FROM {from} \
                  WHERE {predicate} ORDER BY id LIMIT {limit} OFFSET {offset}) AS page ORDER BY page.id"
             );
             let mut result = conn.query(sql.as_str(), Parameters::None)?;
@@ -1079,8 +1312,9 @@ impl Store {
     ) -> Result<FlightBatches, Error> {
         // Rewrite the projection to use build-time derivatives.
         let projection = Self::rewrite_projection(&projection);
+        let from = self.table_from.clone();
         let sql = format!(
-            "SELECT {projection} FROM (SELECT id, geom, properties, source_id, cx, cy, name FROM features \
+            "SELECT {projection} FROM (SELECT id, geom, properties, source_id, cx, cy, name FROM {from} \
              WHERE {predicate} ORDER BY id LIMIT {limit} OFFSET {offset}) AS page ORDER BY page.id"
         );
         self.stream_sql(sql).await

@@ -33,6 +33,7 @@ pub async fn tile(
     // SQL builds per request; validation runs before any database work.
     // Tiles hold up to 5k features and run Mercator transforms, so they
     // share the bulk lane with Flight.
+    let from = store.table_from().to_string();
     let body = store
         .run_bytes(true, move |conn| {
             // Single scan: the HAVING maps empty tiles to zero rows
@@ -45,7 +46,7 @@ pub async fn tile(
                 "SELECT ST_AsMVT(t, {}) FROM (SELECT id, ST_AsMVTGeom(\
                  ST_Transform(page.geom, 'EPSG:4326', 'EPSG:3857', always_xy := true), \
                  ST_Extent(ST_MakeEnvelope({west}, {}, {}, {north})), 4096, 64, true) AS geom \
-                 FROM (SELECT id, geom FROM features WHERE {fetch} ORDER BY id LIMIT 5000) AS page) t \
+                 FROM (SELECT id, geom FROM {from} WHERE {fetch} ORDER BY id LIMIT 5000) AS page) t \
                  WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom) HAVING count(*) > 0",
                 filter::quote(&collection),
                 north - span,
