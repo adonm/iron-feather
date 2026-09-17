@@ -208,6 +208,29 @@ small page 180 → 104 ms; Paris/Brussels small pages flat (~240/~120 ms)
 — the join is gone there too, but the base scan over 128 MB/64k-RG files
 dominates, so bytes saved do not always convert to latency saved.
 
+25M-row row-group benchmark (same 25,358,254 rows repacked at 8192 and
+2048 groups — id-multiset hash matches the base on all three; grid order,
+zstd-3, 128 MB target files kept; 26/26/27 files, 3.0/3.1/3.2 GiB).
+11 distinct warmed URLs, sequential client, p50 of 7; bodies
+byte-identical across variants on every URL:
+
+| query | local base → rg8k → rg2k | warm Cachey base → rg8k → rg2k |
+|---|---|---|
+| dense small limit=10 (4 cities, p50 each) | ~92–108 → ~49–56 → ~142–146 ms | ~93–136 → ~51–92 → ~139–168 ms |
+| dense limit=100 (Paris/Brussels 10 km) | ~119–124 → ~52–60 → ~144–146 ms | ~114–123 → ~53–62 → ~144 ms |
+| rural limit=10/100 | ~100/233 → ~52/87 → ~142/161 ms | ~105/245 → ~57/88 → ~144/168 ms |
+| bulk quarter-extent limit=1000 | 3955 → 1377 → 703 ms | 4048 → 1408 → 754 ms |
+| bulk full-extent limit=100 | 1942 → 444 → 322 ms | 2036 → 457 → 339 ms |
+
+Engine cut (Paris small page, EXPLAIN ANALYZE): Data Read 50.7 → 6.9 →
+4.9 MB while time goes ~140 → ~46 → ~135 ms. Fewer bytes, more time:
+per-row-group open/evaluate costs (~470 groups/file × 26 files at
+threads=1) dominate once pruning saturates. The curve is U-shaped for
+selective queries and monotonic for bulk — so 8192 stays the default
+(already is) and 2048 is a bulk-scan option, not a serving default.
+Re-runs confirm the ordering with no min/max overlap between variants
+on small pages.
+
 Server assembly/encode is microseconds per the `ogc items render`
 `candidate_us`/`fetch_us` debug split — DuckDB time is the total.
 Concurrency leaves p50 flat while rps scales: no queueing, latency is
