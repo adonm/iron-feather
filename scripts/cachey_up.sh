@@ -20,14 +20,6 @@ SLOW_S3_MS="${SLOW_S3_MS:-0}"
 source "$(dirname "$0")/dev-s3.env"
 
 # --- MinIO (S3-compatible bucket store; plain files under $RIG/minio) --------
-# Retired containers from the Garage era are removed (their data dir stays
-# on disk); the new store starts empty, so re-publish after switching.
-for old in iron-garage iron-redis; do
-  if docker ps --format '{{.Names}}' | grep -qx "$old"; then
-    echo "retiring $old (zerofs-era; data dir kept under $RIG)"
-    docker rm -f "$old" >/dev/null
-  fi
-done
 if ! docker ps --format '{{.Names}}' | grep -qx iron-minio; then
   mkdir -p "$RIG/minio"
   docker rm -f iron-minio >/dev/null 2>&1 || true
@@ -44,10 +36,17 @@ fi
 export AWS_ACCESS_KEY_ID="$S3_USER" AWS_SECRET_ACCESS_KEY="$S3_PASS"
 
 # --- Optional slow-S3 simulation -------------------------------------------
-# toxiproxy adds SLOW_S3_MS downstream latency to Garage traffic so Cachey
-# misses cost a realish RTT while hits stay loopback-fast.
+# toxiproxy adds downstream latency to MinIO traffic so Cachey misses cost
+# a realish RTT while hits stay loopback-fast. SLOW_S3_MS sets the base
+# latency toxic (jitter ~1/6); SLOW_S3_BANDWIDTH_KBPS optionally throttles
+# throughput and SLOW_S3_TIMEOUT_MS stalls new connections, for degraded
+# profiles beyond steady latency (throttling/stall regimes).
 S3_ENDPOINT=http://127.0.0.1:3900
-if [ "$SLOW_S3_MS" -gt 0 ] 2>/dev/null; then
+SLOW_S3_BANDWIDTH_KBPS="${SLOW_S3_BANDWIDTH_KBPS:-0}"
+SLOW_S3_TIMEOUT_MS="${SLOW_S3_TIMEOUT_MS:-0}"
+if { [ "$SLOW_S3_MS" -gt 0 ] 2>/dev/null; } \
+  || { [ "$SLOW_S3_BANDWIDTH_KBPS" -gt 0 ] 2>/dev/null; } \
+  || { [ "$SLOW_S3_TIMEOUT_MS" -gt 0 ] 2>/dev/null; }; then
   if ! docker ps --format '{{.Names}}' | grep -qx iron-toxy; then
     docker rm -f iron-toxy >/dev/null 2>&1 || true
     docker run -d --name iron-toxy --network host "$TOXY_IMAGE" >/dev/null
@@ -56,13 +55,27 @@ if [ "$SLOW_S3_MS" -gt 0 ] 2>/dev/null; then
       sleep 1
     done
   fi
+  # Drop the pre-rename proxy if present, then ensure the current one.
+  curl -sf -X DELETE http://127.0.0.1:8474/proxies/garage >/dev/null 2>&1 || true
   curl -sf -X POST http://127.0.0.1:8474/proxies -H 'Content-Type: application/json' \
-    -d '{"name":"garage","listen":"127.0.0.1:3903","upstream":"127.0.0.1:3900"}' >/dev/null 2>&1 || true
-  curl -sf -X DELETE http://127.0.0.1:8474/proxies/garage/toxics/slow >/dev/null 2>&1 || true
-  curl -sf -X POST http://127.0.0.1:8474/proxies/garage/toxics -H 'Content-Type: application/json' \
-    -d "{\"name\":\"slow\",\"type\":\"latency\",\"stream\":\"downstream\",\"toxicity\":1.0,\"attributes\":{\"latency\":$SLOW_S3_MS,\"jitter\":$((SLOW_S3_MS / 6 + 1))}}" >/dev/null
+    -d '{"name":"s3","listen":"127.0.0.1:3903","upstream":"127.0.0.1:3900"}' >/dev/null 2>&1 || true
+  curl -sf -X DELETE http://127.0.0.1:8474/proxies/s3/toxics/slow >/dev/null 2>&1 || true
+  curl -sf -X DELETE http://127.0.0.1:8474/proxies/s3/toxics/throttle >/dev/null 2>&1 || true
+  curl -sf -X DELETE http://127.0.0.1:8474/proxies/s3/toxics/stall >/dev/null 2>&1 || true
+  if [ "$SLOW_S3_MS" -gt 0 ] 2>/dev/null; then
+    curl -sf -X POST http://127.0.0.1:8474/proxies/s3/toxics -H 'Content-Type: application/json' \
+      -d "{\"name\":\"slow\",\"type\":\"latency\",\"stream\":\"downstream\",\"toxicity\":1.0,\"attributes\":{\"latency\":$SLOW_S3_MS,\"jitter\":$((SLOW_S3_MS / 6 + 1))}}" >/dev/null
+  fi
+  if [ "$SLOW_S3_BANDWIDTH_KBPS" -gt 0 ] 2>/dev/null; then
+    curl -sf -X POST http://127.0.0.1:8474/proxies/s3/toxics -H 'Content-Type: application/json' \
+      -d "{\"name\":\"throttle\",\"type\":\"bandwidth\",\"stream\":\"downstream\",\"toxicity\":1.0,\"attributes\":{\"rate\":$SLOW_S3_BANDWIDTH_KBPS}}" >/dev/null
+  fi
+  if [ "$SLOW_S3_TIMEOUT_MS" -gt 0 ] 2>/dev/null; then
+    curl -sf -X POST http://127.0.0.1:8474/proxies/s3/toxics -H 'Content-Type: application/json' \
+      -d "{\"name\":\"stall\",\"type\":\"timeout\",\"stream\":\"downstream\",\"toxicity\":1.0,\"attributes\":{\"timeout\":$SLOW_S3_TIMEOUT_MS}}" >/dev/null
+  fi
   S3_ENDPOINT=http://127.0.0.1:3903
-  echo "slow S3: +${SLOW_S3_MS}ms via toxiproxy :3903"
+  echo "slow S3: latency=${SLOW_S3_MS}ms bandwidth=${SLOW_S3_BANDWIDTH_KBPS}KB/s stall=${SLOW_S3_TIMEOUT_MS}ms via toxiproxy :3903"
 fi
 
 # --- Cachey (the AZ-local cache stand-in; plain HTTP, no mount) --------------

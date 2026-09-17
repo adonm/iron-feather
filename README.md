@@ -68,20 +68,25 @@ Geometry is non-null, 2D CRS84 (longitude/latitude). Import uses both Parquet
 bbox statistics and exact geometry intersection, then writes ZSTD Parquet
 clustered by `--sort` (`grid` cell, `hilbert`, or `none`) with tight per-file
 bbox statistics (`xmin/ymin/xmax/ymax` min/max pruning replaces a spatial
-index). `cx`/`cy`/`name` are build-time derivatives (centroid coordinates and
+index). Measured on the 25M-row NW-Europe shard (25 files): `grid` keeps
+the default — city windows prune to 4–5 files vs 7–8 for `hilbert`, a
+rural window to 3 vs 4, at 3.0 vs 3.1 GiB total. `cx`/`cy`/`name` are
+build-time derivatives (centroid coordinates and
 display name) so Flight `x`/`y`/`name` projections avoid per-row geometry and
 JSON work. `--source-id` defaults to `1`. Metadata is discovered from the
 shard's actual layers. A versioned `<catalog>.manifest.json` (backend,
 schema version, source, bbox, rows, layout) is written alongside the catalog.
 
 Publication is atomic and refuses to overwrite an existing catalog: data
-files publish first (never deleting files another snapshot references), then
-the catalog that references them. Build a new snapshot and restart
-`serve --shard NEW_CATALOG` to switch. The serving host needs the matching
-DuckDB `spatial`/`ducklake` extensions installed; `build` installs them
-automatically. `--data-url` records the prefix the Parquet files will be
-served from (defaults to the local data dir); sync the data dir to S3/HTTPS
-afterwards when publishing remotely.
+files publish first (additive copy only, never deleting files another
+snapshot references), then the catalog that references them. Build a new
+snapshot and restart `serve --shard NEW_CATALOG` to switch. The serving
+host needs the matching DuckDB `spatial`/`ducklake` extensions installed;
+`build` installs them automatically. `--data-url` records the
+zone-independent data root in the catalog (an `s3://` prefix for lake
+publishes; defaults to the local data dir); each reader overrides it with
+`serve --data-base` pointing at its zone's Cachey, so relative Parquet
+paths resolve AZ-local everywhere.
 
 ```sh
 just fixture-nw-europe            # ~10 GB Benelux + N. France buildings
@@ -98,9 +103,11 @@ different shard extent.
 `serve --shard` takes a local `.ducklake` catalog path or the HTTP(S)/`s3://`
 URL of a published catalog and attaches it read-only. For private S3,
 prefer a short-lived presigned HTTPS object URL; the binary deliberately does
-not accept cloud credentials. In production the catalog's Parquet paths point
-at the per-zone Cachey `/fetch/` prefix, so all storage reads are range GETs
-through the shared page cache (see [`docs/cachey-lake.md`](docs/cachey-lake.md)).
+not accept cloud credentials. In production the catalog stores a
+zone-independent `s3://` data root and each reader passes `--data-base`
+with its zone's Cachey `/fetch/` prefix, so all storage reads are range
+GETs through the zone-shared page cache (see
+[`docs/cachey-lake.md`](docs/cachey-lake.md)).
 Every pooled connection is switched to the attached catalog; DuckLake resolves
 its Parquet data files at query time, so all SQL remains server-generated.
 
@@ -171,7 +178,10 @@ cargo run --locked --example flight_client
 `serve` also listens for [Quack](https://duckdb.org/docs/current/quack/overview)
 (`--quack-listen`, default `127.0.0.1:9494`; `--no-quack` disables it): raw
 SQL over HTTP for DuckDB-native bulk consumers, served from a **separate
-database** so bulk scans never evict the OGC/Flight working set.
+database** so bulk scans never evict the OGC/Flight working set. That
+separate database carries its own engine budgets, so the wide reader
+fleet disables it (`quack.enabled=false` in the chart); run bulk on
+dedicated pods or locally instead.
 
 The view is narrowed, not full access:
 

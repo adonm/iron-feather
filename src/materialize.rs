@@ -25,12 +25,12 @@ pub struct Build {
     /// Local directory receiving the Parquet data files.
     #[arg(long, default_value = "fixtures/osm.files")]
     pub data_dir: PathBuf,
-    /// URL prefix the Parquet files will be served from: baked into the
-    /// catalog as each file's location, so readers need no shared
-    /// filesystem (point it at the Cachey `/fetch/` prefix or S3).
-    /// Defaults to the absolute local data dir so a local build serves
-    /// immediately; sync the data dir to S3/HTTPS afterwards when
-    /// publishing remotely.
+    /// Zone-independent data root recorded in the catalog as DuckLake's
+    /// `DATA_PATH` (an `s3://` prefix for lake publishes). Data file paths
+    /// stay relative, so each reader overrides the root per zone with
+    /// `serve --data-base` (its Cachey `/fetch/` prefix) and no zone reads
+    /// through another. Defaults to the absolute local data dir so a local
+    /// build serves immediately with no override.
     #[arg(long)]
     pub data_url: Option<String>,
     /// Optional cap for development slices; omit to materialize the whole bbox.
@@ -50,9 +50,11 @@ pub struct Build {
     pub source_id: i64,
 }
 
-/// Rewrite the staging-absolute data file paths DuckLake recorded at write
-/// time to the portable publish root (local dir or http(s)/s3 URL). Runs
-/// after the catalog is renamed into place, before staging is removed.
+/// Rewrite any staging-absolute data file paths DuckLake recorded at
+/// write time to the portable publish root (local dir or http(s)/s3 URL).
+/// Modern DuckLake stores relative paths plus a `DATA_PATH`, making this a
+/// no-op; it stays as a guard for absolute-path layouts. Must run on the
+/// staging catalog before it is renamed into place.
 fn repoint_data_paths(
     catalog: &str,
     staging_data: &str,
@@ -85,6 +87,42 @@ fn repoint_data_paths(
         ],
     )?;
     Ok(())
+}
+
+/// Fail the build if any data file path still points into staging.
+/// Catches repoint regressions before anything is published.
+fn verify_no_staging_paths(
+    catalog: &str,
+    staging_data: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let staging_root = if staging_data.ends_with('/') {
+        staging_data.to_string()
+    } else {
+        format!("{staging_data}/")
+    };
+    let db = db::open_memory()?;
+    let conn = db.connect()?;
+    db::execute_all(&conn, &["LOAD ducklake"])?;
+    let catalog_sql = filter::quote(&format!("ducklake:{catalog}"));
+    db::execute_all(
+        &conn,
+        &[
+            &format!("ATTACH {catalog_sql} AS lake (READ_ONLY)"),
+            "USE lake",
+        ],
+    )?;
+    let rows = db::text_table(
+        &conn,
+        &format!(
+            "SELECT path FROM __ducklake_metadata_lake.ducklake_data_file WHERE path LIKE {} LIMIT 1",
+            filter::quote(&format!("{staging_root}%")),
+        ),
+    )?;
+    if rows.is_empty() {
+        Ok(())
+    } else {
+        Err("catalog still references staging data paths".into())
+    }
 }
 
 fn publish_tree(source: &Path, dest: &Path) -> std::io::Result<()> {
@@ -155,6 +193,19 @@ impl Build {
             }
         };
         let rows = self.write(&staging_catalog, &staging_data, &data_url)?;
+        // Finish the catalog in staging before anything is visible: repoint
+        // (a no-op when DuckLake already stored relative paths) and verify
+        // no staging-absolute paths remain. Publishing first and mutating
+        // afterwards would expose a half-built catalog on crash.
+        repoint_data_paths(
+            &staging_catalog.to_string_lossy(),
+            &staging_data.to_string_lossy(),
+            &data_url,
+        )?;
+        verify_no_staging_paths(
+            &staging_catalog.to_string_lossy(),
+            &staging_data.to_string_lossy(),
+        )?;
         // Publish data files first, then the catalog that references them.
         // Existing published files are never deleted: another snapshot may
         // still reference them. Layout nesting (schema/table dirs) is
@@ -162,14 +213,6 @@ impl Build {
         std::fs::create_dir_all(&self.data_dir)?;
         publish_tree(&staging_data, &self.data_dir)?;
         std::fs::rename(&staging_catalog, &self.out)?;
-        // DuckLake records the staging absolute paths at write time; repoint
-        // them at the portable root so the catalog serves from its published
-        // location (local dir, S3, or Cachey URL) after staging is removed.
-        repoint_data_paths(
-            &self.out.to_string_lossy(),
-            &staging_data.to_string_lossy(),
-            &data_url,
-        )?;
         // Versioned manifest travels atomically with the shard so servers
         // can verify the snapshot and clients can reason about layout.
         let built_at = std::time::SystemTime::now()

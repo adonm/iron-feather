@@ -3,7 +3,7 @@ use super::common::{ticket, Fixture};
 use crate::{
     api,
     flight::ShardFlight,
-    store::{Error, Store},
+    store::{Error, Store, StoreConfig},
 };
 use arrow_flight::flight_service_server::FlightService;
 use duckdb_neo::Parameters;
@@ -266,6 +266,78 @@ async fn shard_is_read_only_and_missing_files_are_not_created() {
 }
 
 #[tokio::test]
+async fn data_path_override_redirects_relative_reads() {
+    // The published catalog stores relative data paths plus a
+    // zone-independent DATA_PATH; readers override it per zone. Prove the
+    // override is honored (not ignored): an override to an empty dir must
+    // fail data reads, and an override to a copied dir must succeed after
+    // the original is removed.
+    let fixture = Fixture::new(1);
+    let catalog = fixture.catalog.clone();
+    let files = fixture._dir.path().join("files");
+    assert!(files.join("main").exists());
+    let open = |data_path_override: Option<String>| {
+        Store::open_config(StoreConfig {
+            location: catalog.clone(),
+            data_path_override,
+            connections: 1,
+            max_waiters: 0,
+            max_wait: std::time::Duration::ZERO,
+            bulk_limit: 1,
+            threads: 1,
+            memory_mb: 0,
+            query_timeout: std::time::Duration::ZERO,
+            ..StoreConfig::default()
+        })
+    };
+    // Sanity: stored DATA_PATH serves without an override.
+    let plain = open(None).unwrap();
+    // Force a real data read (count(*) can be answered from metadata).
+    let len = plain
+        .run(|conn| {
+            crate::db::text_table(conn, "SELECT id FROM features ORDER BY id LIMIT 1")
+                .map(|rows| rows.len())
+        })
+        .await
+        .unwrap();
+    assert_eq!(len, 1);
+    // Override to an empty dir must fail (proves the override is honored
+    // rather than ignored): even the open-time probe needs data files.
+    let empty = fixture._dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let empty_override = format!("{}/", empty.to_str().unwrap());
+    assert!(open(Some(empty_override)).is_err());
+    // Copy data aside, remove the original, override to the copy: reads
+    // must succeed via the override alone.
+    let copy = fixture._dir.path().join("files-copy");
+    copy_dir(&files, &copy);
+    std::fs::remove_dir_all(&files).unwrap();
+    let copy_override = format!("{}/", copy.to_str().unwrap());
+    let redirected = open(Some(copy_override)).unwrap();
+    let len = redirected
+        .run(|conn| {
+            crate::db::text_table(conn, "SELECT id FROM features ORDER BY id LIMIT 1")
+                .map(|rows| rows.len())
+        })
+        .await
+        .unwrap();
+    assert_eq!(len, 1);
+}
+
+fn copy_dir(source: &std::path::Path, dest: &std::path::Path) {
+    std::fs::create_dir_all(dest).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = dest.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn store_rejects_bad_engine_budgets() {
     // threads=0 fails before any storage is touched.
     let dir = tempfile::tempdir().unwrap();
@@ -320,7 +392,7 @@ async fn heavy_pages_share_the_bulk_lane() {
 async fn duck_tuning_reports_engine_budgets() {
     // Storage caching lives in Cachey; DuckDB only reports engine budgets.
     let fixture = Fixture::new(1);
-    let tuning = fixture.store.duck_tuning().await;
+    let tuning = fixture.store.duck_tuning();
     let keys: Vec<_> = tuning.iter().map(|(k, _)| k.as_str()).collect();
     assert!(keys.contains(&"threads"));
     assert!(keys.contains(&"memory_limit"));

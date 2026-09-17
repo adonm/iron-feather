@@ -27,11 +27,12 @@ fmt-check:
 fixture-osm *args: setup-duckdb
     cargo run --locked -- build --bbox=13.35,52.48,13.45,52.55 {{args}}
 
-# ~9 GB / 25M-row Benelux + northern France buildings for capacity work.
+# ~3 GB / 25M-row Benelux + northern France buildings for capacity work.
 # Takes on the order of ten minutes on a fast link. Builds a DuckLake
-# catalog plus Parquet data files directly; --data-url must match the prefix
-# the files will be served from (local data dir by default). Layout tuning
-# via --sort grid|hilbert|none --file-mb N --row-group N.
+# catalog plus Parquet data files directly; --data-url sets the stored
+# zone-independent DATA_PATH (an s3:// prefix for lake publishes, local
+# data dir by default). Layout tuning via --sort grid|hilbert|none
+# --file-mb N --row-group N.
 fixture-nw-europe out="fixtures/nw-europe.ducklake" datadir="fixtures/nw-europe.files" *args: setup-duckdb
     cargo run --locked -- build --bbox=2,48,6,54 --out {{quote(out)}} --data-dir {{quote(datadir)}} {{args}}
 
@@ -76,9 +77,11 @@ cachey-down *args:
     bash scripts/cachey_down.sh {{args}}
 
 # Publish a new immutable snapshot, then move a ref at it.
-# Build bakes --data-url Cachey paths into the catalog, data syncs to S3,
-# then the catalog + ref move. Catalog versioning (ref service) is TBD;
-# locally scripts/lake_ref.sh plays that role over tiny S3 objects.
+# Build stores a zone-independent DATA_PATH (s3://); readers override it
+# per zone via --data-base (see lake-serve). Uploads are additive only:
+# data files are never deleted (older catalogs still reference them) and
+# catalog keys are never overwritten. Catalog versioning (ref service) is
+# TBD; locally scripts/lake_ref.sh plays that role over tiny S3 objects.
 # Example: just lake-publish sha_003 --bbox=13.38,52.50,13.42,52.54 --limit 20000
 lake-publish sha *args: cachey-up
     #!/usr/bin/env bash
@@ -93,10 +96,15 @@ lake-publish sha *args: cachey-up
     trap 'rm -rf "$STAGE"' EXIT
     sha={{quote(sha)}}
     name="$sha.ducklake"
-    CACHEY=http://127.0.0.1:8088
+    if rclone lsf "lake:lake/catalogs/" 2>/dev/null | grep -qx "$name"; then
+      echo "catalog key $name already published; refusing to overwrite" >&2
+      exit 1
+    fi
     cargo run --locked -- build --out "$STAGE/$name" \
-      --data-dir "$STAGE/files" --data-url "$CACHEY/fetch/lake/data/" {{args}}
-    rclone sync "$STAGE/files" lake:lake/data/
+      --data-dir "$STAGE/files" --data-url "s3://lake/data/" {{args}}
+    # Additive only: copy new files, never delete. Publication order is
+    # data first, then the catalog that references them, then the ref move.
+    rclone copy "$STAGE/files" lake:lake/data/
     rclone copyto "$STAGE/$name" "lake:lake/catalogs/$name"
     bash scripts/lake_ref.sh set "$name" latest
     bash scripts/lake_ref.sh list
@@ -104,12 +112,14 @@ lake-publish sha *args: cachey-up
 # Serve the catalog a ref points at (default: latest), resolved once at
 # startup; the reader stays pinned to that snapshot across later publishes.
 # Args are positional: just lake-serve <tag> --listen ...
+# Data reads go through the local Cachey via --data-base; the catalog's
+# stored s3:// DATA_PATH is never fetched directly.
 lake-serve ref="latest" *args: cachey-up
     #!/usr/bin/env bash
     set -euo pipefail
     catalog=$(bash scripts/lake_ref.sh get {{quote(ref)}})
     [ -n "$catalog" ] || { echo "empty ref {{quote(ref)}}" >&2; exit 1; }
-    cargo run --locked --release -- serve --shard "http://127.0.0.1:8088/fetch/lake/catalogs/$catalog" {{args}}
+    cargo run --locked --release -- serve --shard "http://127.0.0.1:8088/fetch/lake/catalogs/$catalog" --data-base "http://127.0.0.1:8088/fetch/lake/data/" {{args}}
 
 # --- kind whole-stack ------------------------------------------------------
 # 2-AZ kind cluster (nodes carry topology.kubernetes.io/zone; /nvme is the

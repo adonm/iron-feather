@@ -124,12 +124,9 @@ impl ShardFlight {
     async fn info(&self, descriptor: FlightDescriptor) -> Result<FlightInfo, Status> {
         let ticket = Self::descriptor(&descriptor)?;
         let planned = self.plan(&ticket, None)?;
-        let schema = self
-            .store
-            .arrow("FALSE".into(), planned.projection, 1, 0)
-            .await?;
+        let schema = self.store.flight_schema(&planned.projection).await?;
         Ok(FlightInfo::new()
-            .try_with_schema(&schema.schema)
+            .try_with_schema(&schema)
             .map_err(|e| Status::internal(e.to_string()))?
             .with_descriptor(descriptor)
             .with_endpoint(
@@ -178,11 +175,8 @@ impl FlightService for ShardFlight {
     ) -> Result<Response<SchemaResult>, Status> {
         let ticket = Self::descriptor(request.get_ref())?;
         let planned = self.plan(&ticket, None)?;
-        let result = self
-            .store
-            .arrow("FALSE".into(), planned.projection, 1, 0)
-            .await?;
-        let schema = SchemaAsIpc::new(&result.schema, &Default::default())
+        let schema = self.store.flight_schema(&planned.projection).await?;
+        let schema = SchemaAsIpc::new(&schema, &Default::default())
             .try_into()
             .map_err(|e: arrow::error::ArrowError| Status::internal(e.to_string()))?;
         Ok(Response::new(schema))
@@ -208,8 +202,9 @@ impl FlightService for ShardFlight {
         // Batches stream through per-stream and process-wide byte budgets;
         // the guard lives in the response stream so premature drop marks
         // cancellation and interrupts the query, while normal completion
-        // clears the handle before the connection is reused. The consumer
-        // releases both budgets on read.
+        // clears the handle before the connection is reused. Each batch
+        // carries a budget permit that releases on drop, so queued but
+        // unconsumed batches cannot strand budget on disconnect.
         let planned = self.plan(&ticket, header)?;
         let batches = self
             .store
@@ -222,32 +217,26 @@ impl FlightService for ShardFlight {
             .await?;
         let schema = batches.schema.clone();
         let input = futures::stream::unfold(
-            (
-                batches.batches,
-                batches.guard,
-                batches.buffered,
-                batches.global_buffered,
-            ),
-            |(mut rx, guard, buffered, global)| async move {
+            (batches.batches, batches.guard),
+            |(mut rx, guard)| async move {
                 match rx.recv().await {
-                    Some(Ok(batch)) => {
-                        let size = batch.get_array_memory_size();
-                        buffered.fetch_sub(size, std::sync::atomic::Ordering::AcqRel);
-                        global.fetch_sub(size, std::sync::atomic::Ordering::AcqRel);
+                    Some(Ok(budgeted)) => {
+                        let batch = budgeted.batch;
+                        // The permit drops here, releasing budget on receive.
                         Some((
                             Ok(batch)
                                 as Result<
                                     arrow::record_batch::RecordBatch,
                                     arrow_flight::error::FlightError,
                                 >,
-                            (rx, guard, buffered, global),
+                            (rx, guard),
                         ))
                     }
                     Some(Err(e)) => Some((
                         Err(arrow_flight::error::FlightError::from_external_error(
                             Box::new(e),
                         )),
-                        (rx, guard, buffered, global),
+                        (rx, guard),
                     )),
                     None => None,
                 }

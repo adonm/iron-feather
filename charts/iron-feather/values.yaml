@@ -27,13 +27,26 @@ resources: {}
 service:
   port: 3000
 
+# S3 key prefix holding the immutable Parquet data files. The published
+# catalog stores `s3://<bucket>/<dataPrefix>/` as its DATA_PATH; readers
+# override it per zone to their Cachey (`--data-base`), so the same
+# snapshot serves zone-local everywhere. The writer builds with the same
+# prefix.
+dataPrefix: data
+
 # S3 endpoint + Secret for the writer/seed upload sidecars. Defaults address
 # the bundled MinIO; point at real S3 when cachey.enabled=false.
-# cacheyUrlBase overrides the per-zone Cachey base readers and the writer use
+# cacheyUrlBase overrides the per-zone Cachey base readers use
 # (default: this release's zone Services).
 s3endpoint: ""
 s3secret: ""
 cacheyUrlBase: ""
+
+# Quack bulk protocol. Off by default in the wide reader fleet: it opens a
+# second DuckDB database with its own engine budgets per pod. Enable on
+# dedicated bulk pods (or locally) instead.
+quack:
+  enabled: false
 
 # Optional single writer: hourly build + S3 upload + ref move (the ETL
 # publisher). The only component allowed to mutate refs. Needs the S3
@@ -44,7 +57,6 @@ writer:
   bbox: 13.35,52.48,13.45,52.55
   limit: 20000
   collection: buildings
-  dataPrefix: data
 
 # Subchart (MinIO + per-zone Cachey). Disable when pointing at an
 # existing estate (then set cacheyUrl overrides explicitly).

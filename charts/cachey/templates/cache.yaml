@@ -1,7 +1,9 @@
 # One Cachey Deployment + Service per zone. Readers in a zone fetch through
 # their zone's Service, so the page cache is shared zone-wide. Cache disk is
-# node-local (hostPath NVMe); the Deployment pins to its zone so the disk
-# follows the cache identity across restarts.
+# node-local (hostPath NVMe); the Deployment pins to its zone.
+# Recreate (never RollingUpdate): two Cachey processes must never open the
+# same hostPath cache dir at once. A reschedule to another node in the zone
+# starts cold on that node's disk; treat node replacement as a cold cache.
 {{- range $zone := .Values.zones }}
 {{- $name := include "cachey.zoneName" (list $ $zone) }}
 ---
@@ -23,6 +25,8 @@ metadata:
   name: {{ $name }}
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: {{ $name }}

@@ -9,7 +9,7 @@ WIPE=false
 
 docker rm -f iron-cachey >/dev/null 2>&1 || echo "cachey not running"
 if $WIPE; then
-  docker rm -f iron-garage iron-toxy >/dev/null 2>&1 || true
-  rm -rf "$RIG/garage" "$RIG/publish-"* "$RIG/cachey-endpoint-used"
-  echo "wiped garage + cachey state"
+  docker rm -f iron-minio iron-toxy >/dev/null 2>&1 || true
+  rm -rf "$RIG/minio" "$RIG/publish-"* "$RIG/cachey-endpoint-used"
+  echo "wiped minio + cachey state"
 fi

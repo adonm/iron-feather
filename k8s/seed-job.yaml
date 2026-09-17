@@ -31,7 +31,7 @@ spec:
               iron-feather build --bbox=13.35,52.48,13.45,52.55 --limit 20000 \
                 --out /stage/sha_berlin.ducklake \
                 --data-dir /stage/files \
-                --data-url 'http://lake-cachey-az-a/fetch/lake/data/'
+                --data-url 's3://lake/data/'
               printf '%s' sha_berlin.ducklake > /stage/catalog-name
           volumeMounts:
             - name: stage
@@ -46,8 +46,13 @@ spec:
             - |
               set -eu
               name=$(cat /stage/catalog-name)
-              rclone sync /stage/files lake:lake/data/
-              rclone copyto "/stage/$name" "lake:lake/catalogs/$name"
+              # Additive only: never delete data another snapshot references.
+              # The seed catalog key is fixed; skip the upload when a previous
+              # seed already published it (idempotent re-runs).
+              rclone copy /stage/files lake:lake/data/
+              if ! rclone lsf "lake:lake/catalogs/" 2>/dev/null | grep -qx "$name"; then
+                rclone copyto "/stage/$name" "lake:lake/catalogs/$name"
+              fi
               rclone rcat lake:lake/refs/latest < /stage/catalog-name
               rclone rcat lake:lake/refs/main < /stage/catalog-name
               echo seeded

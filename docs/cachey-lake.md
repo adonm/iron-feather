@@ -32,10 +32,13 @@ serve --shard http://cachey/fetch/lake/catalogs/sha_002.ducklake
 `Store` resolves `max(snapshot_id)` at startup and re-attaches with
 `SNAPSHOT_VERSION`, so even a swapped catalog object cannot move a reader.
 
-`build` bakes the publish location into the catalog: `--data-url` becomes
-each data file's location (Cachey `/fetch/` prefix or S3), so readers need
-no shared filesystem. The default is the absolute local data dir, which
-keeps `just fixture-osm` serving straight off disk.
+`build` records a zone-independent data root in the catalog: `--data-url`
+becomes the stored DuckLake `DATA_PATH` (an `s3://` prefix for lake
+publishes), with data file paths stored relative to it. Readers override
+that root per zone (`serve --data-base <zone-cachey>/fetch/<bucket>/data/`),
+so the same snapshot resolves Parquet through each zone's own Cachey and
+no zone reads through another. The default is the absolute local data dir,
+which keeps `just fixture-osm` serving straight off disk with no override.
 
 ## Local rig (this repo)
 
@@ -106,7 +109,9 @@ Findings (verified, not assumed):
 - DuckDB's httpfs only issues closed single-range GETs, which is exactly
   Cachey's `/fetch` contract — but Cachey rejects bare `HEAD` (400) and
   open-ended ranges (416), so the reader `wait-for-publish` probe sends
-  `Range: bytes=0-0`.
+  `Range: bytes=0-0` plus `C0-Config: fps=true` (without the header Cachey
+  tries virtual-hosted `bucket.host`, which plain cluster DNS cannot
+  resolve).
 - Cachey (AWS SDK) needs no S3-side addressing help: every DuckDB
   connection creates a scoped HTTP secret sending `C0-Config: fps=true`,
   so Cachey fetches path-style against the endpoint host itself — the
@@ -123,23 +128,37 @@ Findings (verified, not assumed):
   revalidation: safe because snapshots are immutable and data files are
   never rewritten — keep that invariant (same as today's "never delete
   referenced files").
+- Zone locality is structural, not hoped for: the catalog stores a
+  zone-independent `s3://` data root and every reader attaches with its
+  zone's Cachey as `DATA_PATH` override, verified by the stack test
+  (two Cacheys; zone B's full walk adds zero downloads to zone A).
 
 ## Benchmark: Berlin 20k, mixed 500 unique (slow S3, 300 ms miss RTT)
 
 Single local server, MinIO backend through the latency proxy, 8 conns,
-one pass over the workload per row:
+one pass over the workload per row. 300 ms is a degraded-latency profile
+for comparison, not a real-world maximum: AWS documents retrying slow
+requests after seconds, so add stall/timeout/throttle toxics
+(`SLOW_S3_TIMEOUT_MS`, `SLOW_S3_BANDWIDTH_KBPS`) alongside it when
+characterizing tails.
 
-| path | rps | p50 | p99 |
-|---|---|---|---|
-| uncached (direct range GETs, every miss pays) | 9 | 802 ms | 1670 ms |
-| Cachey cold (fresh server + empty Cachey, first pass) | 128 | 46 ms | 364 ms |
-| Cachey warm (immediate repeat pass) | 145 | 46 ms | 124 ms |
+| path | rps | p50 | p95 | p99 |
+|---|---|---|---|---|
+| uncached direct S3 (no Cachey; every miss pays) | 9 | 802 ms | — | 1670 ms |
+| Cachey cold (fresh server + empty Cachey, first pass) | 128 | 46 ms | — | 364 ms |
+| Cachey warm (immediate repeat pass) | 145 | 46 ms | — | 124 ms |
 
 0 rejected, 0 errors throughout. Notes: the working set (~4 MB) fills
 Cachey within the first request wave, so cold-vs-warm differs only in
 p99 (single-miss cost) while p50 sits on the DuckDB compute floor;
 uncached pays the miss on nearly every request. Wipe Cachey (restart the
 container; memory-only in this rig) plus a fresh server for a true cold.
+Re-run all rows against one identical snapshot; record startup
+separately from steady state, plus S3 bytes/GETs, Cachey hits, CPU and
+RSS. The uncached row below predates the direct-S3 flags: re-run it as
+`serve --shard s3://lake/catalogs/<sha> --s3-endpoint 127.0.0.1:3903
+--s3-key-id … --s3-secret …` (no `--data-base`, no rclone translation)
+before quoting.
 
 On loopback, fetch cost nearly vanishes and DuckDB compute dominates:
 cold Cachey runs ~134 rps / p50 47 ms, warm Cachey ~140-150 rps — the
@@ -156,8 +175,9 @@ cache), and zone-shared Cachey is what absorbs repeats across pods.
   zone-wide with no CSI, FUSE, or sidecars.
 - Only Cachey and the writer talk to S3 (writer uploads; Cachey fetches).
   Readers need no cloud credentials at all.
-- Publish = build with `--data-url` at the Cachey prefix, upload immutable
-  data + catalog, then advance refs through the API. Hourly-or-slower
+- Publish = build with `--data-url s3://<bucket>/data/`, upload immutable
+  data + catalog additively (copy, never delete; catalog keys never
+  overwritten), then advance refs through the API. Hourly-or-slower
   cadence means no distributed locking and no
   Nessie/Postgres/registry.duckdb: refs are tiny objects (here) or API
   rows (prod).

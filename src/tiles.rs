@@ -35,18 +35,9 @@ pub async fn tile(
     // share the bulk lane with Flight.
     let body = store
         .run_bytes(true, move |conn| {
-            // Predicates build inside the worker: the cached path never
-            // formats SQL.
+            // Single scan: the HAVING maps empty tiles to zero rows
+            // (204) instead of an empty MVT blob (200).
             let fetch = Store::predicate(&collection, Some(bbox), &sources);
-            // Empty tiles stay 204: check cheaply before paying for the
-            // transform + encode.
-            let empty = db::strings_col(
-                conn,
-                &format!("SELECT 'x' FROM features WHERE {fetch} LIMIT 1"),
-            )?;
-            if empty.is_empty() {
-                return Ok(Bytes::new());
-            }
             // Page first, transform second: the inner scan selects raw
             // id/geom for the page, the outer runs Mercator + clip only
             // over those rows instead of every scanned match.
@@ -55,7 +46,7 @@ pub async fn tile(
                  ST_Transform(page.geom, 'EPSG:4326', 'EPSG:3857', always_xy := true), \
                  ST_Extent(ST_MakeEnvelope({west}, {}, {}, {north})), 4096, 64, true) AS geom \
                  FROM (SELECT id, geom FROM features WHERE {fetch} ORDER BY id LIMIT 5000) AS page) t \
-                 WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)",
+                 WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom) HAVING count(*) > 0",
                 filter::quote(&collection),
                 north - span,
                 west + span

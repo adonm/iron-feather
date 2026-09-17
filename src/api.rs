@@ -231,7 +231,7 @@ fn health(Query(_): Query<NoQuery>) -> &'static str {
 #[handler]
 async fn metrics(Query(_): Query<NoQuery>, Data(store): Data<&Arc<Store>>) -> Response {
     let mut out = format!("http_requests {}\n", store.http_requests());
-    for (key, value) in store.duck_tuning().await {
+    for (key, value) in store.duck_tuning() {
         out.push_str(&format!("duck_setting_{key} {value}\n"));
     }
     Response::builder()
@@ -568,12 +568,21 @@ async fn item(
     store.collection(&collection)?;
     let kind = geojson_type(req)?;
     let sources = source_ids(req, query.sources.as_deref())?;
-    // SQL builds per request; equivalent spellings normalize to the same
-    // predicate through the validated inputs.
+    // Filter by id, collection and sources in SQL so mismatches never pay
+    // for geometry/JSON conversion; empty source sets match nothing.
+    if sources.is_empty() {
+        return Err(Error::NotFound(id).into());
+    }
+    let sources_sql = sources
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let query: QueryFn = Box::new(move |conn: &NeoConnection| {
         let sql = format!(
-            "SELECT {FEATURE_COLUMNS}, layer, source_id::VARCHAR FROM features WHERE id = {} LIMIT 1",
-            filter::quote(&id)
+            "SELECT {FEATURE_COLUMNS} FROM features WHERE id = {} AND layer = {} AND source_id IN ({sources_sql}) LIMIT 1",
+            filter::quote(&id),
+            filter::quote(&collection),
         );
         let mut rows = crate::db::text_table(conn, &sql)?;
         let mut row = match rows.pop() {
@@ -581,23 +590,14 @@ async fn item(
             None => return Err(Error::NotFound(id)),
         };
         let mut cells = row.drain(..);
-        let (raw_id, geometry, properties, actual_collection, source_id) = (
+        let (raw_id, geometry, properties) = (
             cells
                 .next()
                 .flatten()
                 .ok_or_else(|| Error::NotFound(id.clone()))?,
             cells.next().flatten(),
             cells.next().flatten(),
-            cells.next().flatten().unwrap_or_default(),
-            cells
-                .next()
-                .flatten()
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(-1),
         );
-        if actual_collection != collection || !sources.contains(&source_id) {
-            return Err(Error::NotFound(id));
-        }
         let links = feature_links(&raw_id, &collection, &sources);
         let single = feature(
             raw_id,

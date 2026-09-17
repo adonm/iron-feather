@@ -31,7 +31,9 @@
 
 use crate::{
     db::{self, NeoConnection, NeoDatabase},
-    store::{cachey_secret_sql, Error, StoreConfig},
+    store::{
+        attach_options, cachey_secret_sql, cachey_secret_sql_named, http_origin, Error, StoreConfig,
+    },
 };
 use duckdb_neo::Parameters;
 use std::net::SocketAddr;
@@ -166,6 +168,11 @@ fn setup_quack_session(
         &[
             "SET autoinstall_known_extensions=false",
             "SET autoload_known_extensions=false",
+            // Same immutable-snapshot rationale as the serving pool (see
+            // setup_session): cache metadata, skip revalidation.
+            "SET parquet_metadata_cache=true",
+            "SET enable_http_metadata_cache=true",
+            "SET validate_external_file_cache='NO_VALIDATION'",
         ],
     )?;
     // Same Cachey request-config header as the serving pool: the guard
@@ -173,14 +180,21 @@ fn setup_quack_session(
     if let Some(secret) = cachey_secret_sql(catalog) {
         db::execute_all(conn, &[secret.as_str()])?;
     }
-    let _ = (cfg, remote);
+    if let Some(base) = cfg.data_path_override.as_deref() {
+        if http_origin(base) != http_origin(catalog) {
+            if let Some(secret) = cachey_secret_sql_named("iron_feather_cachey_data", base) {
+                db::execute_all(conn, &[secret.as_str()])?;
+            }
+        }
+    }
+    let _ = remote;
     db::execute_all(
         conn,
         &[
             &format!(
-                "ATTACH {} AS shard (READ_ONLY, SNAPSHOT_VERSION {})",
+                "ATTACH {} AS shard ({})",
                 crate::filter::quote(catalog),
-                snapshot
+                attach_options(Some(snapshot), cfg.data_path_override.as_deref()),
             ),
             // The guard lives in memory: the lake catalog is read-only and
             // would reject the CREATE.

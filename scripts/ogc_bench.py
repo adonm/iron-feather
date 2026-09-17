@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--jitter", action="store_true")
     parser.add_argument("--seed", type=int, default=0,
-                        help="offset jitter sequence so repeat runs miss the cache")
+                        help="offset jitter sequence so repeat runs use fresh URLs")
     parser.add_argument("--warmup", type=int, default=0,
                         help="unmeasured requests per worker before timing")
     args = parser.parse_args()

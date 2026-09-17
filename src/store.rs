@@ -15,6 +15,7 @@ use arrow::{
 use bytes::Bytes;
 use duckdb_neo::Parameters;
 use std::{
+    collections::HashMap,
     io::Write,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -83,6 +84,19 @@ pub struct StoreConfig {
     pub flight_stream_bytes: usize,
     /// Process-wide Flight buffer in bytes across all streams.
     pub flight_total_bytes: usize,
+    /// Zone-local base for Parquet reads (e.g. this zone's Cachey
+    /// `/fetch/<bucket>/data/`). When set, every `ATTACH` adds
+    /// `DATA_PATH '<base>', OVERRIDE_DATA_PATH true`, so relative data
+    /// file paths resolve through this zone even though the published
+    /// catalog stores a zone-independent `DATA_PATH`. `None` uses the
+    /// stored path (local fixtures, direct-S3 baselines).
+    pub data_path_override: Option<String>,
+    /// Direct-S3 credentials for baselines that read `s3://` paths without
+    /// Cachey (all three must be set). Prod Cachey mode needs no S3
+    /// credentials: only Cachey talks to S3.
+    pub s3_endpoint: Option<String>,
+    pub s3_key_id: Option<String>,
+    pub s3_secret: Option<String>,
 }
 
 impl Default for StoreConfig {
@@ -98,6 +112,10 @@ impl Default for StoreConfig {
             query_timeout: Duration::from_millis(30_000),
             flight_stream_bytes: FLIGHT_BYTE_BUDGET,
             flight_total_bytes: FLIGHT_TOTAL_BUDGET,
+            data_path_override: None,
+            s3_endpoint: None,
+            s3_key_id: None,
+            s3_secret: None,
         }
     }
 }
@@ -113,13 +131,21 @@ pub struct ArrowResult {
 /// The guard owns the shared query state: premature drop marks cancellation
 /// and interrupts the query, aborts the deadline task, and never touches a
 /// reused connection because the worker clears the handle before returning
-/// it to the pool.
+/// it to the pool. Each batch carries a budget permit that releases on
+/// drop, so batches queued but never consumed (disconnect) cannot strand
+/// budget.
 pub struct FlightBatches {
     pub schema: SchemaRef,
-    pub batches: tokio::sync::mpsc::Receiver<Result<RecordBatch, Error>>,
+    pub batches: tokio::sync::mpsc::Receiver<Result<BudgetedBatch, Error>>,
     pub guard: StreamGuard,
-    pub buffered: Arc<AtomicUsize>,
-    pub global_buffered: Arc<AtomicUsize>,
+}
+
+/// One Arrow batch plus the byte-budget reservation backing it. Dropping
+/// releases both the per-stream and process-wide reservations and wakes
+/// one blocked producer.
+pub struct BudgetedBatch {
+    pub batch: RecordBatch,
+    _permit: BudgetPermit,
 }
 
 /// Raw v2 connection handle: a pointer, always safe to interrupt from any
@@ -217,61 +243,93 @@ impl Drop for RunGuard {
 
 /// Byte budget for buffered Flight batches: bounds peak memory by payload
 /// bytes instead of batch count (16 large polygon batches can dwarf 16 id
-/// batches). Senders reserve before send; the consumer releases on receive.
-/// Oversized single batches are allowed once the buffer drains, so progress
-/// is guaranteed.
+/// batches). Producers reserve before send; each reservation lives in the
+/// queued batch and releases on drop, so disconnects cannot strand budget.
+/// Waiting producers sleep on a Condvar (notified on every release) with a
+/// short timeout to recheck cancellation. Oversized single batches are
+/// allowed once the buffer drains, so progress is guaranteed.
 pub const FLIGHT_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 /// Process-wide cap across all concurrent Flight streams.
 pub const FLIGHT_TOTAL_BUDGET: usize = 128 * 1024 * 1024;
 
-fn reserve_flight_budget(
-    per_stream: &AtomicUsize,
-    global: &AtomicUsize,
+/// Process-wide byte budget shared by all Flight streams. The Condvar is
+/// the single wake-up channel for every blocked producer: any release
+/// (per-stream or global) notifies it.
+struct SharedBudget {
+    used: Mutex<usize>,
+    cvar: std::sync::Condvar,
+    cap: usize,
+}
+
+/// Per-stream budget. No Condvar of its own: waiters sleep on the shared
+/// budget's Condvar, which every release notifies.
+struct StreamBudget {
+    used: Mutex<usize>,
+    cap: usize,
+}
+
+struct BudgetPermit {
+    global: Arc<SharedBudget>,
+    per: Arc<StreamBudget>,
+    size: usize,
+}
+
+impl Drop for BudgetPermit {
+    fn drop(&mut self) {
+        // Lock order is global-then-per everywhere (see acquire); the
+        // critical sections only touch counters.
+        let mut global = self.global.used.lock().unwrap();
+        let mut per = self.per.used.lock().unwrap();
+        *global = global.saturating_sub(self.size);
+        *per = per.saturating_sub(self.size);
+        drop(per);
+        drop(global);
+        self.global.cvar.notify_one();
+    }
+}
+
+/// Reserve `size` bytes on both budgets, waiting (cancellation-aware) for
+/// room. Returns `None` when the consumer disconnected or the query was
+/// cancelled. Lock order is global-then-per, matching [`BudgetPermit`].
+fn acquire_flight_budget(
+    global: &Arc<SharedBudget>,
+    per: &Arc<StreamBudget>,
     state: &QueryState,
     closed: impl Fn() -> bool,
     size: usize,
-    per_stream_budget: usize,
-    total_budget: usize,
-) -> bool {
+) -> Option<BudgetPermit> {
     // Oversized batches cannot satisfy the normal bound; let one through
     // once both buffers drain instead of spinning forever.
-    let oversized = size > per_stream_budget || size > total_budget;
+    let oversized = size > per.cap || size > global.cap;
+    let mut global_used = global.used.lock().unwrap();
     loop {
         if closed() || state.is_cancelled() {
-            return false;
+            return None;
         }
-        let cur_stream = per_stream.load(Ordering::Acquire);
-        let cur_total = global.load(Ordering::Acquire);
-        let fits = if oversized {
-            cur_stream == 0 && cur_total == 0
-        } else {
-            cur_stream + size <= per_stream_budget && cur_total + size <= total_budget
-        };
-        if fits {
-            // Reserve both counters; roll back the first if the second races.
-            match per_stream.compare_exchange_weak(
-                cur_stream,
-                cur_stream + size,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => match global.compare_exchange_weak(
-                    cur_total,
-                    cur_total + size,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => return true,
-                    Err(_) => {
-                        per_stream.fetch_sub(size, Ordering::AcqRel);
-                        continue;
-                    }
-                },
-                Err(_) => continue,
+        {
+            let mut per_used = per.used.lock().unwrap();
+            let fits = if oversized {
+                *global_used == 0 && *per_used == 0
+            } else {
+                *global_used + size <= global.cap && *per_used + size <= per.cap
+            };
+            if fits {
+                *global_used += size;
+                *per_used += size;
+                return Some(BudgetPermit {
+                    global: Arc::clone(global),
+                    per: Arc::clone(per),
+                    size,
+                });
             }
-        } else {
-            std::thread::sleep(Duration::from_millis(1));
         }
+        // Sleep until a release notifies us; the timeout rechecks
+        // cancellation/disconnect promptly.
+        let (guard, _) = global
+            .cvar
+            .wait_timeout(global_used, Duration::from_millis(50))
+            .unwrap();
+        global_used = guard;
     }
 }
 
@@ -303,11 +361,17 @@ pub struct Store {
     max_wait: Duration,
     query_timeout: Duration,
     flight_stream_budget: usize,
-    flight_total_budget: usize,
-    flight_used: Arc<AtomicUsize>,
+    flight_global: Arc<SharedBudget>,
     #[allow(dead_code)]
     manifest: Option<ShardManifest>,
     http_requests: AtomicUsize,
+    /// Engine budgets resolved once at startup (`duckdb_settings()` values).
+    /// `/metrics` serves these without consuming a pool connection.
+    tuning: Vec<(String, String)>,
+    /// Arrow schemas per Flight projection, resolved once via a `FALSE`
+    /// probe and reused. Projections depend only on requested columns, so
+    /// discovery never needs a pool connection after warmup.
+    flight_schemas: Mutex<HashMap<String, SchemaRef>>,
 }
 
 /// An HTTP representation with its validator. Cloning is cheap: the body
@@ -371,6 +435,26 @@ fn manifest_path_for(location: &str) -> Option<String> {
     Some(format!("{location}.manifest.json"))
 }
 
+/// `ATTACH ... AS shard (...)` options. The data-path override (when
+/// set) redirects relative data file reads to this zone's Cachey while
+/// the catalog's stored `DATA_PATH` stays zone-independent.
+pub(crate) fn attach_options(snapshot: Option<i64>, data_path_override: Option<&str>) -> String {
+    let mut opts = vec!["READ_ONLY".to_string()];
+    if let Some(base) = data_path_override {
+        let base = if base.ends_with('/') {
+            base.to_string()
+        } else {
+            format!("{base}/")
+        };
+        opts.push(format!("DATA_PATH {}", crate::filter::quote(&base)));
+        opts.push("OVERRIDE_DATA_PATH true".to_string());
+    }
+    if let Some(snapshot) = snapshot {
+        opts.push(format!("SNAPSHOT_VERSION {snapshot}"));
+    }
+    opts.join(", ")
+}
+
 /// Attach path for a catalog location. Shared by the serving pool and the
 /// Quack instance so both pin the same snapshot.
 pub fn catalog_url(location: &str) -> String {
@@ -380,7 +464,7 @@ pub fn catalog_url(location: &str) -> String {
 /// Origin (scheme + authority) of an http(s) location, with an optional
 /// `ducklake:` catalog prefix stripped. Used to scope the Cachey
 /// request-config secret below.
-fn http_origin(location: &str) -> Option<String> {
+pub(crate) fn http_origin(location: &str) -> Option<String> {
     let location = location.strip_prefix("ducklake:").unwrap_or(location);
     for scheme in ["http://", "https://"] {
         if let Some(rest) = location.strip_prefix(scheme) {
@@ -397,7 +481,8 @@ fn http_origin(location: &str) -> Option<String> {
 /// under the catalog's origin, so Cachey fetches path-style from any
 /// S3-compatible backend. `None` for local catalogs (no HTTP involved).
 /// Data files live under the same Cachey base in every layout we publish,
-/// so the catalog origin covers them.
+/// so the catalog origin covers them; when a data-path override points at
+/// a different origin, the caller adds a second secret for it.
 pub(crate) fn cachey_secret_sql(location: &str) -> Option<String> {
     http_origin(location).map(|origin| {
         format!(
@@ -405,6 +490,37 @@ pub(crate) fn cachey_secret_sql(location: &str) -> Option<String> {
             crate::filter::quote(&origin)
         )
     })
+}
+
+pub(crate) fn cachey_secret_sql_named(name: &str, location: &str) -> Option<String> {
+    http_origin(location).map(|origin| {
+        format!(
+            "CREATE OR REPLACE SECRET {name} (TYPE http, SCOPE {}, EXTRA_HTTP_HEADERS MAP {{'C0-Config': 'fps=true'}})",
+            crate::filter::quote(&origin)
+        )
+    })
+}
+
+/// `CREATE SECRET` for direct-S3 reads (baselines only): explicit key pair
+/// plus endpoint, so DuckDB signs `s3://` requests itself instead of going
+/// through Cachey. The endpoint accepts `host:port` or a full URL; the
+/// scheme decides `USE_SSL`. Path-style addressing works against MinIO
+/// and real S3 alike.
+pub(crate) fn s3_secret_sql(endpoint: &str, key_id: &str, secret: &str) -> String {
+    let (host, use_ssl) = if let Some(rest) = endpoint.strip_prefix("https://") {
+        (rest.trim_end_matches('/'), true)
+    } else if let Some(rest) = endpoint.strip_prefix("http://") {
+        (rest.trim_end_matches('/'), false)
+    } else {
+        (endpoint.trim_end_matches('/'), false)
+    };
+    format!(
+        "CREATE OR REPLACE SECRET iron_feather_s3 (TYPE s3, PROVIDER config, KEY_ID {}, SECRET {}, REGION 'us-east-1', ENDPOINT {}, USE_SSL {}, URL_STYLE 'path')",
+        crate::filter::quote(key_id),
+        crate::filter::quote(secret),
+        crate::filter::quote(host),
+        use_ssl,
+    )
 }
 
 /// Full per-connection setup: extensions, then the catalog attach pinned to
@@ -423,11 +539,38 @@ fn setup_session(conn: &NeoConnection, cfg: &StoreConfig, _remote: bool) -> Resu
     if let Some(secret) = cachey_secret_sql(&cfg.location) {
         db::execute_all(conn, &[secret.as_str()])?;
     }
+    // The data-path override usually shares the catalog's origin (same
+    // zone Cachey); when it doesn't, scope a second secret to it so
+    // Parquet fetches carry the same request config.
+    if let Some(base) = cfg.data_path_override.as_deref() {
+        if http_origin(base) != http_origin(&cfg.location) {
+            if let Some(secret) = cachey_secret_sql_named("iron_feather_cachey_data", base) {
+                db::execute_all(conn, &[secret.as_str()])?;
+            }
+        }
+    }
+    // Direct-S3 baselines only: prod Cachey mode sets no S3 credentials.
+    if let (Some(endpoint), Some(key_id), Some(secret)) = (
+        cfg.s3_endpoint.as_deref(),
+        cfg.s3_key_id.as_deref(),
+        cfg.s3_secret.as_deref(),
+    ) {
+        let sql = s3_secret_sql(endpoint, key_id, secret);
+        db::execute_all(conn, &[sql.as_str()])?;
+    }
     db::execute_all(
         conn,
         &[
             "SET autoinstall_known_extensions=false",
             "SET autoload_known_extensions=false",
+            // Immutable snapshots: Parquet files and catalog objects are
+            // never modified in place, so metadata parsing and cache
+            // revalidation are pure overhead. Cache footers/HTTP metadata
+            // and skip validation (which would otherwise re-HEAD Cachey
+            // per query). Byte caching still lives in Cachey below.
+            "SET parquet_metadata_cache=true",
+            "SET enable_http_metadata_cache=true",
+            "SET validate_external_file_cache='NO_VALIDATION'",
         ],
     )
 }
@@ -470,6 +613,16 @@ impl Store {
                 "bulk limit must be between 1 and connections".into(),
             ));
         }
+        let s3_parts = [
+            cfg.s3_endpoint.is_some(),
+            cfg.s3_key_id.is_some(),
+            cfg.s3_secret.is_some(),
+        ];
+        if s3_parts.iter().any(|p| *p) && s3_parts.iter().any(|p| !*p) {
+            return Err(Error::Invalid(
+                "--s3-endpoint, --s3-key-id and --s3-secret must be set together".into(),
+            ));
+        }
         // Only a cap below the pool size changes behavior; at full size bulk
         // shares the queue like everything else.
         let bulk = (cfg.bulk_limit < cfg.connections)
@@ -492,6 +645,7 @@ impl Store {
             db.set_option(&memory)?;
         }
         let catalog = catalog_url(&cfg.location);
+        let data_override = cfg.data_path_override.as_deref();
         // Open one connection per pool slot. The ATTACH is database-level:
         // the opener attaches latest to resolve the snapshot, then detaches
         // and re-attaches pinned; every connection only switches into it.
@@ -502,8 +656,9 @@ impl Store {
             &opener,
             &[
                 &format!(
-                    "ATTACH {} AS shard (READ_ONLY)",
-                    crate::filter::quote(&catalog)
+                    "ATTACH {} AS shard ({})",
+                    crate::filter::quote(&catalog),
+                    attach_options(None, data_override),
                 ),
                 "USE shard",
             ],
@@ -517,9 +672,9 @@ impl Store {
                 "USE memory",
                 "DETACH shard",
                 &format!(
-                    "ATTACH {} AS shard (READ_ONLY, SNAPSHOT_VERSION {})",
+                    "ATTACH {} AS shard ({})",
                     crate::filter::quote(&catalog),
-                    snapshot
+                    attach_options(Some(snapshot), data_override),
                 ),
                 "USE shard",
             ],
@@ -551,6 +706,22 @@ impl Store {
         let manifest = manifest_path_for(&cfg.location)
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| serde_json::from_str::<ShardManifest>(&text).ok());
+        // Engine budgets are fixed at open; resolve once so /metrics never
+        // borrows a pool connection.
+        let mut tuning = Vec::new();
+        for key in ["threads", "memory_limit"] {
+            let rows = db::text_table(
+                probe,
+                &format!("SELECT value FROM duckdb_settings() WHERE name='{key}'"),
+            )?;
+            if let Some(value) = rows
+                .into_iter()
+                .next()
+                .and_then(|mut row| row.pop().flatten())
+            {
+                tuning.push((key.to_string(), value));
+            }
+        }
         Ok(Self {
             collections,
             snapshot,
@@ -562,10 +733,15 @@ impl Store {
             max_wait: cfg.max_wait,
             query_timeout: cfg.query_timeout,
             flight_stream_budget: cfg.flight_stream_bytes,
-            flight_total_budget: cfg.flight_total_bytes,
-            flight_used: Arc::new(AtomicUsize::new(0)),
+            flight_global: Arc::new(SharedBudget {
+                used: Mutex::new(0),
+                cvar: std::sync::Condvar::new(),
+                cap: cfg.flight_total_bytes,
+            }),
             manifest,
             http_requests: AtomicUsize::new(0),
+            tuning,
+            flight_schemas: Mutex::new(HashMap::new()),
         })
     }
 
@@ -575,29 +751,18 @@ impl Store {
         self.http_requests.load(Ordering::Relaxed)
     }
 
+    /// Currently reserved Flight buffer bytes process-wide. Exposed for
+    /// tests to prove disconnects cannot strand budget.
+    #[allow(dead_code)]
+    pub fn flight_used_bytes(&self) -> usize {
+        *self.flight_global.used.lock().unwrap()
+    }
+
     /// Storage-cache tuning actually in effect. All block/metadata caching
     /// lives in the Cachey layer the catalog URLs point at; DuckDB only reports its
     /// engine budgets here so bench logs stay comparable.
-    pub async fn duck_tuning(&self) -> Vec<(String, String)> {
-        self.run(|conn| {
-            let mut out = Vec::new();
-            for key in ["threads", "memory_limit"] {
-                let rows = db::text_table(
-                    conn,
-                    &format!("SELECT value FROM duckdb_settings() WHERE name='{key}'"),
-                )?;
-                if let Some(value) = rows
-                    .into_iter()
-                    .next()
-                    .and_then(|mut row| row.pop().flatten())
-                {
-                    out.push((key.to_string(), value));
-                }
-            }
-            Ok(out)
-        })
-        .await
-        .unwrap_or_default()
+    pub fn duck_tuning(&self) -> Vec<(String, String)> {
+        self.tuning.clone()
     }
 
     pub fn collection(&self, id: &str) -> Result<(), Error> {
@@ -744,6 +909,26 @@ impl Store {
         Ok(CachedBody::with_bytes(bytes))
     }
 
+    /// Arrow schema for a Flight projection, resolved once and reused.
+    /// Schemas depend only on requested columns (never the predicate), so
+    /// discovery pays one `FALSE` probe per unique projection; the pool
+    /// stays free afterwards.
+    pub async fn flight_schema(&self, projection: &str) -> Result<SchemaRef, Error> {
+        let projection = Self::rewrite_projection(projection);
+        if let Some(hit) = self.flight_schemas.lock().unwrap().get(&projection) {
+            return Ok(hit.clone());
+        }
+        let schema = self
+            .arrow("FALSE".into(), projection.clone(), 1, 0)
+            .await?
+            .schema;
+        self.flight_schemas
+            .lock()
+            .unwrap()
+            .insert(projection, schema.clone());
+        Ok(schema)
+    }
+
     /// Single predicate-preserving Arrow query (see [`Store::predicate`]);
     /// limit/offset page the scan. Page first, convert second: geometry and
     /// JSON projections run only over the selected page instead of every
@@ -780,22 +965,30 @@ impl Store {
 
     /// One bounded streaming lifecycle. The worker owns
     /// its checkout and bulk permit until it exits; the guard owns
-    /// cancellation from before execution through final delivery.
+    /// cancellation from before execution through final delivery,
+    /// including while waiting for the schema.
     async fn stream_sql(&self, sql: String) -> Result<FlightBatches, Error> {
         let bulk = self.acquire_bulk()?;
         let checkout = self.checkout().await?;
         let state = Arc::new(QueryState::new());
         state.set_interrupt(checkout.conn.as_ref().unwrap());
         let timeout = self.timeout_task(state.clone());
+        // Own cancellation before the schema wait: dropping this future
+        // aborts the deadline task and interrupts the worker instead of
+        // leaking a detached timeout.
+        let guard = StreamGuard {
+            state: state.clone(),
+            timeout,
+        };
         let (schema_tx, schema_rx) = tokio::sync::oneshot::channel::<Result<SchemaRef, Error>>();
         // Count-based bound is a backstop; the byte budgets do the real work.
-        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, Error>>(16);
-        let per_stream = Arc::new(AtomicUsize::new(0));
-        let per_stream_send = per_stream.clone();
-        let global_send = self.flight_used.clone();
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Result<BudgetedBatch, Error>>(16);
+        let per_stream = Arc::new(StreamBudget {
+            used: Mutex::new(0),
+            cap: self.flight_stream_budget,
+        });
+        let global = Arc::clone(&self.flight_global);
         let state_worker = state.clone();
-        let per_budget = self.flight_stream_budget;
-        let total_budget = self.flight_total_budget;
         tokio::task::spawn_blocking(move || {
             let _checkout = checkout;
             let _bulk = bulk;
@@ -835,20 +1028,25 @@ impl Store {
                     Ok(batch) => batch,
                 };
                 let size = batch.get_array_memory_size();
-                if !reserve_flight_budget(
-                    &per_stream_send,
-                    &global_send,
+                let Some(permit) = acquire_flight_budget(
+                    &global,
+                    &per_stream,
                     &state_worker,
                     || batch_tx.is_closed(),
                     size,
-                    per_budget,
-                    total_budget,
-                ) {
+                ) else {
                     break;
-                }
-                if batch_tx.blocking_send(Ok(batch)).is_err() {
-                    per_stream_send.fetch_sub(size, Ordering::AcqRel);
-                    global_send.fetch_sub(size, Ordering::AcqRel);
+                };
+                // The permit travels with the batch: it releases when the
+                // consumer drops it, or when a queued batch is dropped
+                // after disconnect. Send failure drops the permit inline.
+                if batch_tx
+                    .blocking_send(Ok(BudgetedBatch {
+                        batch,
+                        _permit: permit,
+                    }))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -861,9 +1059,7 @@ impl Store {
         Ok(FlightBatches {
             schema,
             batches: batch_rx,
-            guard: StreamGuard { state, timeout },
-            buffered: per_stream,
-            global_buffered: self.flight_used.clone(),
+            guard,
         })
     }
 
@@ -966,7 +1162,7 @@ pub(crate) async fn gzip_body(raw: Bytes) -> Result<CachedBody, Error> {
 
 #[cfg(test)]
 mod secret_tests {
-    use super::{cachey_secret_sql, http_origin};
+    use super::{attach_options, cachey_secret_sql, http_origin, s3_secret_sql};
 
     #[test]
     fn origin_scopes_to_scheme_and_authority() {
@@ -990,5 +1186,36 @@ mod secret_tests {
         assert!(sql.contains("SCOPE 'http://lake-cachey-az-a'"));
         assert!(sql.contains("'C0-Config': 'fps=true'"));
         assert_eq!(cachey_secret_sql("fixtures/osm.ducklake"), None);
+    }
+
+    #[test]
+    fn attach_options_cover_read_only_pin_and_zone_override() {
+        assert_eq!(attach_options(None, None), "READ_ONLY");
+        assert_eq!(
+            attach_options(Some(6), None),
+            "READ_ONLY, SNAPSHOT_VERSION 6"
+        );
+        assert_eq!(
+            attach_options(None, Some("http://cachey/fetch/lake/data")),
+            "READ_ONLY, DATA_PATH 'http://cachey/fetch/lake/data/', OVERRIDE_DATA_PATH true"
+        );
+        assert_eq!(
+            attach_options(Some(6), Some("http://cachey/fetch/lake/data/")),
+            "READ_ONLY, DATA_PATH 'http://cachey/fetch/lake/data/', OVERRIDE_DATA_PATH true, SNAPSHOT_VERSION 6"
+        );
+    }
+
+    #[test]
+    fn s3_secret_normalizes_endpoint_and_ssl() {
+        let sql = s3_secret_sql("http://127.0.0.1:3900/", "ak", "sk");
+        assert!(sql.contains("ENDPOINT '127.0.0.1:3900'"));
+        assert!(sql.contains("USE_SSL false"));
+        assert!(sql.contains("URL_STYLE 'path'"));
+        let sql = s3_secret_sql("https://s3.us-east-1.amazonaws.com", "ak", "sk");
+        assert!(sql.contains("ENDPOINT 's3.us-east-1.amazonaws.com'"));
+        assert!(sql.contains("USE_SSL true"));
+        let sql = s3_secret_sql("127.0.0.1:3903", "ak", "sk");
+        assert!(sql.contains("ENDPOINT '127.0.0.1:3903'"));
+        assert!(sql.contains("USE_SSL false"));
     }
 }

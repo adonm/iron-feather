@@ -175,7 +175,7 @@ async fn streaming_slow_reader_still_completes_under_budgets() {
         .unwrap();
     let mut count = 0;
     while let Some(batch) = batches.batches.recv().await {
-        let batch = batch.unwrap();
+        let batch = batch.unwrap().batch;
         count += batch.num_rows();
         // Slow consumer: the producer's byte-budget wait must stay
         // cancellation-aware and make progress.
@@ -198,6 +198,48 @@ async fn streaming_reports_mid_stream_failure_as_error() {
         .await;
     assert!(result.is_err());
     fixture.store.run(|_| Ok(())).await.unwrap();
+}
+
+#[tokio::test]
+async fn streaming_drop_with_queued_batches_releases_budget() {
+    // Budget permits travel with queued batches: dropping the stream
+    // without consuming must release process-wide bytes and return the
+    // pool connection, so the next request still completes.
+    let fixture = Fixture::new(1);
+    let store = fixture.store.clone();
+    let batches = store
+        .arrow_stream("TRUE".into(), "id".into(), 100_000, 0)
+        .await
+        .unwrap();
+    // Wait for the worker to queue at least one batch (budget held).
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while store.flight_used_bytes() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(batches);
+    // Queued permits drop with the channel: budget returns to zero.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while store.flight_used_bytes() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(store.flight_used_bytes(), 0);
+    // The worker exits promptly on disconnect; the pool serves again.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if store.run(|_| Ok(())).await.is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

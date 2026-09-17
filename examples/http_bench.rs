@@ -1,6 +1,6 @@
 //! Closed-loop HTTP benchmark with separate warmup and timed phases.
 //! Duration-based load against one or more running servers (comma-separated
-//! --base for client-side round-robin); reports successful rps, p50, p99,
+//! --base for client-side round-robin); reports successful rps, p50/p95/p99,
 //! rejections and wire throughput. Jitter draws from a shared atomic sequence
 //! so every request in a run is unique, and a fresh --seed per run keeps
 //! repeat runs missing the response cache instead of re-measuring it.
@@ -326,9 +326,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sum();
     let total: usize = statuses.values().sum();
     println!(
-        "mode={mode} requests={total} secs={secs:.2} success_rps={:.0} p50={:?} p99={:?} wire_MB/s={:.1} nonempty={nonempty} rejected={rejected} errors={errors} statuses={statuses:?}",
+        "mode={mode} requests={total} secs={secs:.2} success_rps={:.0} p50={:?} p95={:?} p99={:?} wire_MB/s={:.1} nonempty={nonempty} rejected={rejected} errors={errors} statuses={statuses:?}",
         latencies.len() as f64 / secs,
         pct(0.5),
+        pct(0.95),
         pct(0.99),
         bytes as f64 / secs / 1e6,
     );

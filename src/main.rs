@@ -30,6 +30,24 @@ enum Command {
         #[arg(long, env = "IRON_FEATHER_SHARD")]
         /// Local .ducklake catalog path, or http(s)/s3 URL of the catalog.
         shard: String,
+        #[arg(long, env = "IRON_FEATHER_DATA_BASE")]
+        /// Zone-local base for Parquet reads (e.g. this zone's Cachey
+        /// `/fetch/<bucket>/data/`). Overrides the catalog's stored
+        /// zone-independent `DATA_PATH` so relative data paths stay
+        /// AZ-local. Omit for local fixtures and direct-S3 baselines.
+        data_base: Option<String>,
+        #[arg(long, env = "IRON_FEATHER_S3_ENDPOINT")]
+        /// Direct-S3 baseline endpoint (`host:port` or URL, e.g. MinIO).
+        /// Requires `--s3-key-id` and `--s3-secret` together; creates a
+        /// DuckDB S3 secret so `s3://` paths are read without Cachey.
+        /// Never set in prod Cachey mode (readers need no S3 credentials).
+        s3_endpoint: Option<String>,
+        #[arg(long, env = "IRON_FEATHER_S3_KEY_ID", hide_env_values = true)]
+        /// Direct-S3 baseline access key id. See `--s3-endpoint`.
+        s3_key_id: Option<String>,
+        #[arg(long, env = "IRON_FEATHER_S3_SECRET", hide_env_values = true)]
+        /// Direct-S3 baseline secret access key. See `--s3-endpoint`.
+        s3_secret: Option<String>,
         #[arg(long, default_value = "0.0.0.0:3000")]
         listen: SocketAddr,
         #[arg(long, default_value = "127.0.0.1:50051")]
@@ -96,6 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Build(build) => build.run()?,
         Command::Serve {
             shard,
+            data_base,
+            s3_endpoint,
+            s3_key_id,
+            s3_secret,
             listen,
             flight_listen,
             connections,
@@ -119,6 +141,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let config = store::StoreConfig {
                 location: shard.clone(),
+                data_path_override: data_base.clone(),
+                s3_endpoint: s3_endpoint.clone(),
+                s3_key_id: s3_key_id.clone(),
+                s3_secret: s3_secret.clone(),
                 connections: connections.into(),
                 max_waiters: max_waiters.into(),
                 max_wait: std::time::Duration::from_millis(max_wait_ms),
