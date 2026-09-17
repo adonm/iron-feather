@@ -1,7 +1,7 @@
 //! Remote I/O happens here, once: Layercake GeoParquet becomes a versioned
 //! DuckLake snapshot (small catalog plus spatially clustered Parquet) ready
 //! to serve straight from S3.
-use crate::{db, filter, store::ShardManifest};
+use crate::{db, filter, index, store::ShardManifest};
 use clap::Args;
 use duckdb_neo::Parameters;
 use std::path::{Path, PathBuf};
@@ -36,8 +36,11 @@ pub struct Build {
     /// Optional cap for development slices; omit to materialize the whole bbox.
     #[arg(long)]
     pub limit: Option<u32>,
-    /// Target Parquet file size in MiB.
-    #[arg(long, default_value_t = 128)]
+    /// Target Parquet file size in MiB. Smaller files sharpen file-level
+    /// bbox pruning (fewer rows decoded per selective query) at the cost of
+    /// more keys and footers: measured 16/32/64 MB within ~20% of each
+    /// other and 3-5x faster than 128 MB on 25M rows; 32 MB is the middle.
+    #[arg(long, default_value_t = 32)]
     pub file_mb: u64,
     /// Parquet row-group size in rows. Smaller groups sharpen xmin/xmax /
     /// ymin/ymax zone-map pruning because serving reads resolve to
@@ -52,6 +55,83 @@ pub struct Build {
     pub sort: String,
     #[arg(long, default_value_t = 1)]
     pub source_id: i64,
+    /// Name data files by SHA-256 of their bytes instead of random UUIDs.
+    /// Identical builds then produce identical keys, so additive publishes
+    /// upload nothing new and shared caches stay warm. Costs one extra
+    /// full read of the data files.
+    #[arg(long, default_value_t = false)]
+    pub content_address: bool,
+}
+
+/// Compile a serving index for an existing catalog: same document `build`
+/// writes, for repacks or catalogs built before index generation existed.
+/// Footer statistics are read from `data_dir` (local layout mirroring the
+/// catalog's relative paths), so the catalog's own DATA root can stay
+/// remote.
+#[derive(Args, Debug)]
+pub struct Index {
+    /// Local .ducklake catalog path, or http(s) URL of the catalog.
+    #[arg(long)]
+    pub shard: String,
+    /// Local directory holding the data files (schema/table nesting as
+    /// published) for footer reads.
+    #[arg(long)]
+    pub data_dir: PathBuf,
+    /// Output serving-index JSON path.
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
+impl Index {
+    pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let data_dir = std::path::absolute(&self.data_dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.data_dir.to_string_lossy().into_owned());
+        let doc = generate_index(&self.shard, &data_dir)?;
+        if let Some(parent) = self.out.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&self.out, serde_json::to_vec_pretty(&doc)?)?;
+        println!(
+            "indexed {} files in {} partitions -> {}",
+            doc.files.len(),
+            doc.partitions.len(),
+            self.out.display()
+        );
+        Ok(())
+    }
+}
+
+/// Build the serving index for the catalog at `location`, reading footers
+/// from `local_base` (absolute local dir + catalog-relative paths).
+/// Returns the document; callers decide where to write/publish it.
+pub fn generate_index(
+    location: &str,
+    local_base: &str,
+) -> Result<index::ServingIndex, Box<dyn std::error::Error>> {
+    let db = db::open_memory()?;
+    let conn = db.connect()?;
+    db::execute_all(&conn, &["LOAD ducklake", "LOAD spatial"])?;
+    let catalog = crate::store::catalog_url(location);
+    // The alias is fixed so the metadata schema suffix is predictable.
+    db::execute_all(
+        &conn,
+        &[
+            &format!("ATTACH {} AS shard (READ_ONLY)", filter::quote(&catalog)),
+            "USE shard",
+        ],
+    )?;
+    let snapshot = db::int_one(&conn, "SELECT max(snapshot_id) FROM snapshots()")?;
+    let resolved = crate::store::resolve_files(&conn, snapshot)
+        .map_err(|e| format!("index file resolution: {e}"))?;
+    let base = local_base.strip_suffix('/').unwrap_or(local_base);
+    let absolute: Vec<String> = resolved
+        .relpaths
+        .iter()
+        .map(|rel| format!("{base}/{rel}"))
+        .collect();
+    crate::index::build_index(&conn, snapshot, &absolute, &resolved.relpaths)
+        .map_err(|e| format!("index build: {e}").into())
 }
 
 /// Rewrite any staging-absolute data file paths DuckLake recorded at
@@ -127,6 +207,122 @@ fn verify_no_staging_paths(
     } else {
         Err("catalog still references staging data paths".into())
     }
+}
+
+/// Rename staging data files to `<sha256-hex>.parquet` (same directories)
+/// and rewrite the catalog's references to match. Builds are byte-
+/// deterministic for identical inputs, so identical snapshots converge on
+/// identical keys: additive publishes then skip every existing key and the
+/// shared cache never cold-starts on unchanged data. Fails the build on
+/// any mismatch between disk files and catalog references rather than
+/// publishing a half-renamed snapshot.
+fn content_address_data(
+    catalog: &str,
+    staging_data: &Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if entry.file_type()?.is_dir() {
+                walk(&entry.path(), out)?;
+            } else {
+                out.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(staging_data, &mut files)?;
+    if files.is_empty() {
+        return Err("no data files to content-address".into());
+    }
+    let db = db::open_memory()?;
+    let conn = db.connect()?;
+    db::execute_all(&conn, &["LOAD ducklake"])?;
+    let catalog_sql = filter::quote(&format!("ducklake:{catalog}"));
+    db::execute_all(
+        &conn,
+        &[&format!("ATTACH {catalog_sql} AS lake"), "USE lake"],
+    )?;
+    let rows = db::text_table(
+        &conn,
+        "SELECT path FROM __ducklake_metadata_lake.ducklake_data_file",
+    )?;
+    let catalog_paths: Vec<String> = rows
+        .into_iter()
+        .map(|mut row| row.drain(..).next().flatten().unwrap_or_default())
+        .collect();
+    // Every catalog reference must resolve to exactly one disk file and
+    // vice versa; anything else is a publish-time 404 or a missed rename.
+    let mut unmatched: std::collections::HashSet<&str> =
+        catalog_paths.iter().map(String::as_str).collect();
+    let mut renamed = 0;
+    for path in &files {
+        let bytes = std::fs::read(path)?;
+        let hex = format!("{:x}", Sha256::digest(&bytes));
+        let old_name = path
+            .file_name()
+            .ok_or("data file without a file name")?
+            .to_string_lossy()
+            .into_owned();
+        let new_name = format!("{hex}.parquet");
+        let targets: Vec<&str> = unmatched
+            .iter()
+            .filter(|stored| **stored == old_name || stored.ends_with(&format!("/{old_name}")))
+            .copied()
+            .collect();
+        if targets.is_empty() {
+            return Err(format!("catalog has no reference to data file {old_name}").into());
+        }
+        for stored in &targets {
+            let new_stored = if *stored == old_name {
+                new_name.clone()
+            } else {
+                format!(
+                    "{}/{new_name}",
+                    &stored[..stored.len() - old_name.len() - 1]
+                )
+            };
+            db::execute_all(
+                &conn,
+                &[&format!(
+                    "UPDATE __ducklake_metadata_lake.ducklake_data_file SET path = {} WHERE path = {}",
+                    filter::quote(&new_stored),
+                    filter::quote(stored),
+                )],
+            )?;
+            unmatched.remove(stored);
+        }
+        if old_name != new_name {
+            let dest = path.with_file_name(&new_name);
+            if dest.exists() {
+                // Same content already renamed (duplicate bytes in one
+                // dir): keep one copy, point every reference at it, and
+                // drop the stale source so it is never published as an
+                // unreferenced key.
+                let dest_hex = format!("{:x}", Sha256::digest(std::fs::read(&dest)?));
+                if dest_hex != hex {
+                    return Err(format!("name collision for {new_name}").into());
+                }
+                if path != &dest {
+                    std::fs::remove_file(path)?;
+                }
+            } else {
+                std::fs::rename(path, dest)?;
+            }
+        }
+        renamed += 1;
+    }
+    if !unmatched.is_empty() {
+        return Err(format!(
+            "catalog references {} files missing from staging",
+            unmatched.len()
+        )
+        .into());
+    }
+    Ok(renamed)
 }
 
 fn publish_tree(source: &Path, dest: &Path) -> std::io::Result<()> {
@@ -210,6 +406,13 @@ impl Build {
             &staging_catalog.to_string_lossy(),
             &staging_data.to_string_lossy(),
         )?;
+        // Stable keys before anything is visible: identical snapshots
+        // converge on identical data-file names, so additive publishes
+        // skip existing keys and shared caches stay warm.
+        if self.content_address {
+            let renamed = content_address_data(&staging_catalog.to_string_lossy(), &staging_data)?;
+            println!("content-addressed {renamed} data files");
+        }
         // Publish data files first, then the catalog that references them.
         // Existing published files are never deleted: another snapshot may
         // still reference them. Layout nesting (schema/table dirs) is
@@ -239,6 +442,15 @@ impl Build {
         };
         let manifest_out = format!("{}.manifest.json", self.out.display());
         std::fs::write(&manifest_out, serde_json::to_vec_pretty(&manifest)?)?;
+        // Publish-time serving index travels beside the catalog so readers
+        // prune to candidate files without touching catalog metadata per
+        // query. Footer reads come from the just-published local data dir.
+        let data_dir_abs = std::path::absolute(&self.data_dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.data_dir.to_string_lossy().into_owned());
+        let index = generate_index(&self.out.to_string_lossy(), &data_dir_abs)?;
+        let index_out = format!("{}.serving.json", self.out.display());
+        std::fs::write(&index_out, serde_json::to_vec_pretty(&index)?)?;
         println!(
             "materialized {rows} features into {} (+ {})",
             self.out.display(),

@@ -8,14 +8,13 @@ OSM Layercake GeoParquet (HTTPS)
                           └─ shared read-only connection pool
                                ├─ OGC Features / XYZ tiles → response bytes
                                └─ Arrow Flight → native DuckDB Arrow batches
-                          └─ Quack bulk listener → pinned read-only snapshot
 ```
 
-One binary, two commands, one snapshot. Apache-2.0. DuckDB 2.0 nightly
+One binary, three commands, one snapshot. Apache-2.0. DuckDB 2.0 nightly
 (`v2.0.0-alpha42069`; see `scripts/duckdb_version.py` for the exact pin),
 accessed exclusively through the stable v2 C API.
 
-One binary, two commands, one shard. Apache-2.0.
+One binary, three commands (`build`, `index`, `serve`), one shard. Apache-2.0.
 
 ## Quickstart
 
@@ -85,8 +84,12 @@ host needs the matching DuckDB `spatial`/`ducklake` extensions installed;
 `build` installs them automatically. `--data-url` records the
 zone-independent data root in the catalog (an `s3://` prefix for lake
 publishes; defaults to the local data dir); each reader overrides it with
-`serve --data-base` pointing at its zone's Cachey, so relative Parquet
-paths resolve AZ-local everywhere.
+`serve --data-base` (repeat once per Cachey shard) pointing at its zone's
+Cachey, so relative Parquet paths resolve AZ-local everywhere with stable
+shard ownership. `build --content-address` names data files by content
+hash so unchanged snapshots upload nothing new, and every build writes a
+`<catalog>.serving.json` spatial file index beside the catalog (`index`
+recompiles it for older catalogs).
 
 ```sh
 just fixture-nw-europe            # ~10 GB Benelux + N. France buildings
@@ -110,9 +113,11 @@ GETs through the zone-shared page cache (see
 [`docs/cachey-lake.md`](docs/cachey-lake.md)).
 Every pooled connection is switched to the attached catalog; serving reads
 resolve at startup to a frozen `read_parquet` file list over the exact
-files live at the pinned snapshot (falling back to the catalog table on
-any doubt), so all SQL remains server-generated and identical rows serve
-without DuckLake's per-query snapshot join.
+files live at the pinned snapshot, pruned per request to candidate files
+via the published `<catalog>.serving.json` index (falling back to the full
+list, then the catalog table, on any doubt), so all SQL remains
+server-generated and identical rows serve without DuckLake's per-query
+snapshot join.
 
 Spatial queries prune by file/row-group bbox statistics, then run exact
 `ST_Intersects` only on boundary candidates (fully contained bboxes skip it).
@@ -176,43 +181,12 @@ DuckDB produces native Arrow batches, which are encoded directly for Flight with
 cargo run --locked --example flight_client
 ```
 
-## Quack bulk protocol
+## Bulk access
 
-`serve` also listens for [Quack](https://duckdb.org/docs/current/quack/overview)
-(`--quack-listen`, default `127.0.0.1:9494`; `--no-quack` disables it): raw
-SQL over HTTP for DuckDB-native bulk consumers, served from a **separate
-database** so bulk scans never evict the OGC/Flight working set. That
-separate database carries its own engine budgets, so the wide reader
-fleet disables it (`quack.enabled=false` in the chart); run bulk on
-dedicated pods or locally instead.
-
-The view is narrowed, not full access:
-
-- **Pinned snapshot.** The Quack instance attaches the exact snapshot the
-  server resolved at startup (`SNAPSHOT_VERSION`); later publishes stay
-  invisible, and the engine rejects writes on pinned attaches.
-- **Read-only.** Catalog writes fail engine-side.
-- **Token auth.** `--quack-token` / `IRON_FEATHER_QUACK_TOKEN`, else a random
-  per-process token printed once at startup and never logged.
-- **Localhost bind** unless `--allow-remote-quack` is passed (front remote
-  exposure with a TLS-terminating proxy, per upstream guidance).
-- **Statement filter.** A guard macro denies control plane
-  (`quack_serve`/`quack_stop`), server-global settings, catalog topology
-  (`ATTACH`/`DETACH`), file I/O (`COPY`, `read_*`, `st_read`, direct-URL
-  `FROM`), extension loading, and secret creation.
-
-Treat the token as privileged: anything else a holder runs is equivalent to
-a local DuckDB shell. Clients address `shard.<table>`:
-
-```sql
--- Any DuckDB with the quack extension (CLI shown).
-CREATE SECRET (TYPE quack, TOKEN '<token>');
-ATTACH 'quack:127.0.0.1:9494' AS r;
-SELECT count(*) FROM r.shard.main.features;
--- Or stateless per query (no ATTACH needed):
-SELECT * FROM quack_query('quack:127.0.0.1:9494',
-  'SELECT id FROM shard.features ORDER BY id LIMIT 10', token => '<token>');
-```
+Bulk consumers use Arrow Flight (same pinned snapshot, bulk admission
+lane, byte budgets) or query the published Parquet directly with any
+DuckDB. Run broad scans on the dedicated bulk pool
+(`bulk.enabled=true` in the chart), not the interactive readers.
 
 ## Performance and verification
 

@@ -1,11 +1,13 @@
-# One Cachey Deployment + Service per zone. Readers in a zone fetch through
-# their zone's Service, so the page cache is shared zone-wide. Cache disk is
-# node-local (hostPath NVMe); the Deployment pins to its zone.
+# One Cachey Deployment + Service per zone per shard. Readers in a zone
+# hash each object to its owning shard, so the page cache is shared
+# zone-wide with stable ownership. Cache disk is node-local (hostPath
+# NVMe, one dir per shard); Deployments pin to their zone.
 # Recreate (never RollingUpdate): two Cachey processes must never open the
 # same hostPath cache dir at once. A reschedule to another node in the zone
 # starts cold on that node's disk; treat node replacement as a cold cache.
 {{- range $zone := .Values.zones }}
-{{- $name := include "cachey.zoneName" (list $ $zone) }}
+{{- range $i := until ($.Values.shards | int) }}
+{{- $name := printf "%s-s%d" (include "cachey.zoneName" (list $ $zone)) $i }}
 ---
 apiVersion: v1
 kind: Service
@@ -81,6 +83,7 @@ spec:
       volumes:
         - name: cache
           hostPath:
-            path: {{ $.Values.cache.dir }}-{{ $zone }}
+            path: {{ $.Values.cache.dir }}-{{ $zone }}-s{{ $i }}
             type: DirectoryOrCreate
+{{- end }}
 {{- end }}

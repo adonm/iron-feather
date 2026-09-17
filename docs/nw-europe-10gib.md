@@ -15,9 +15,9 @@
 > per-pod response bytes are waste next to zone-shared Cachey, so every
 > request executes and repeated storage reads are absorbed below. Numbers
 > below that quote app-cache hits are historical. All DuckDB
-> access since runs through the stable v2 C API, and Quack serves the pinned
-> snapshot as the bulk protocol (see README). Re-run the matrix on the
-> nightly before quoting ratios.
+> access since runs through the stable v2 C API, and Flight serves the pinned
+> snapshot as the bulk protocol (see README; the Quack experiment was
+> removed). Re-run the matrix on the nightly before quoting ratios.
 
 Question: what does serving a ~10 GB shard look like, and does heap layout
 matter for direct S3 attachment? All runs below are loopback (no real S3

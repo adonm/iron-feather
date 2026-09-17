@@ -484,7 +484,7 @@ async fn items(
     // A cursor bounds the id range, so DuckDB starts at the page instead of
     // discarding `offset` leading rows. Offset stays for direct links.
     let limit = query.limit;
-    let from = store.table_from().to_string();
+    let from = store.read_source(bounds);
     let query: QueryFn = Box::new(move |conn: &NeoConnection| {
         let selected = std::time::Instant::now();
         let req_owned = normalized.clone();
@@ -579,7 +579,10 @@ async fn item(
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let from = store.table_from().to_string();
+    // Single-item reads use the full file list: ids are uncorrelated with
+    // the geographic sort order, so id ranges would not prune. DuckDB
+    // footer statistics still prune inside the read.
+    let from = store.read_source(None);
     let query: QueryFn = Box::new(move |conn: &NeoConnection| {
         let sql = format!(
             "SELECT {FEATURE_COLUMNS} FROM {from} WHERE id = {} AND layer = {} AND source_id IN ({sources_sql}) LIMIT 1",

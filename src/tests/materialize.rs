@@ -37,6 +37,7 @@ fn lake_build(dir: &tempfile::TempDir, parquet: &std::path::Path, name: &str, so
         row_group: 65536,
         sort: sort.into(),
         source_id: 7,
+        content_address: false,
     }
 }
 
@@ -80,6 +81,65 @@ async fn materialization_preserves_layercake_ids_geometry_and_tags() {
     )
     .await;
     assert_eq!(ids, ["relation:1", "way:1"]);
+}
+
+#[tokio::test]
+async fn content_addressed_builds_converge_on_identical_keys() {
+    // Same input built twice must yield identical data-file names, so an
+    // additive publish uploads nothing new and shared caches stay warm.
+    let build_names = |dir: &tempfile::TempDir, name: &str| {
+        let mut build = lake_build(dir, &tiny_parquet(dir), name, "grid");
+        build.content_address = true;
+        build.run().unwrap();
+        let mut names: Vec<String> = Vec::new();
+        let mut stack = vec![dir.path().join(format!("{name}.files"))];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(d).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        names.sort();
+        names
+    };
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let names_a = build_names(&dir_a, "a.ducklake");
+    let names_b = build_names(&dir_b, "b.ducklake");
+    assert!(!names_a.is_empty());
+    assert_eq!(names_a, names_b);
+    assert!(names_a.iter().all(|n| {
+        n.len() == 64 + ".parquet".len()
+            && n.ends_with(".parquet")
+            && n[..64].chars().all(|c| c.is_ascii_hexdigit())
+    }));
+    // The renamed snapshot still serves.
+    let store = Arc::new(
+        Store::open(
+            dir_a.path().join("a.ducklake").to_str().unwrap(),
+            1,
+            0,
+            std::time::Duration::ZERO,
+            1,
+            1,
+            0,
+            std::time::Duration::ZERO,
+        )
+        .unwrap(),
+    );
+    let client = TestClient::new(api::routes(store));
+    let page = body(
+        client
+            .get("/collections/buildings/items?sources=7")
+            .send()
+            .await,
+    )
+    .await;
+    assert_eq!(page["numberReturned"], 2);
 }
 
 #[tokio::test]
@@ -128,6 +188,7 @@ fn failed_build_does_not_publish_or_leave_partial_files() {
         row_group: 65536,
         sort: "grid".into(),
         source_id: 1,
+        content_address: false,
     };
     assert!(build.run().is_err());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);

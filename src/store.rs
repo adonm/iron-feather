@@ -84,19 +84,24 @@ pub struct StoreConfig {
     pub flight_stream_bytes: usize,
     /// Process-wide Flight buffer in bytes across all streams.
     pub flight_total_bytes: usize,
-    /// Zone-local base for Parquet reads (e.g. this zone's Cachey
-    /// `/fetch/<bucket>/data/`). When set, every `ATTACH` adds
-    /// `DATA_PATH '<base>', OVERRIDE_DATA_PATH true`, so relative data
-    /// file paths resolve through this zone even though the published
-    /// catalog stores a zone-independent `DATA_PATH`. `None` uses the
-    /// stored path (local fixtures, direct-S3 baselines).
-    pub data_path_override: Option<String>,
+    /// Zone-local bases for Parquet reads (e.g. this zone's Cachey
+    /// `/fetch/<bucket>/data/`, one entry per cache shard). Every `ATTACH`
+    /// uses the first base as `DATA_PATH` override so relative data file
+    /// paths resolve through this zone even though the published catalog
+    /// stores a zone-independent `DATA_PATH`; per-file serving URLs spread
+    /// across all bases by filename hash for stable cache ownership.
+    /// Empty uses the stored path (local fixtures, direct-S3 baselines).
+    pub data_bases: Vec<String>,
     /// Direct-S3 credentials for baselines that read `s3://` paths without
     /// Cachey (all three must be set). Prod Cachey mode needs no S3
     /// credentials: only Cachey talks to S3.
     pub s3_endpoint: Option<String>,
     pub s3_key_id: Option<String>,
     pub s3_secret: Option<String>,
+    /// Publish-time serving index document (see [`crate::index`]), fetched
+    /// by the caller (local file read or HTTP fetch) and validated here
+    /// against the pinned snapshot. `None` serves without pruning.
+    pub index_json: Option<String>,
 }
 
 impl Default for StoreConfig {
@@ -112,10 +117,11 @@ impl Default for StoreConfig {
             query_timeout: Duration::from_millis(30_000),
             flight_stream_bytes: FLIGHT_BYTE_BUDGET,
             flight_total_bytes: FLIGHT_TOTAL_BUDGET,
-            data_path_override: None,
+            data_bases: Vec::new(),
             s3_endpoint: None,
             s3_key_id: None,
             s3_secret: None,
+            index_json: None,
         }
     }
 }
@@ -348,15 +354,16 @@ pub enum WorkClass {
 
 pub struct Store {
     pub collections: Vec<String>,
-    /// Pinned DuckLake snapshot this instance serves. Resolved at startup;
-    /// both the serving pool and Quack attach at exactly this version.
+    /// Pinned DuckLake snapshot this instance serves. Resolved at startup.
     pub snapshot: i64,
-    /// FROM clause for every serving read of the user table: either the
-    /// catalog table (`features`) or a startup-frozen
-    /// `read_parquet([...])` over the exact files live at [`Self::snapshot`]
-    /// (see [`resolve_table_source`]). Quack keeps serving the catalog
-    /// table; everything else reads through this clause.
-    table_from: String,
+    /// FROM clause fallback for every serving read: the frozen all-files
+    /// list when the snapshot's guards pass, else the catalog table
+    /// (`features`). Used whenever no serving index applies (missing or
+    /// untrusted index, unbounded request shape the index cannot prune).
+    fallback_from: String,
+    /// Publish-time serving index with per-file absolute URLs (shard
+    /// assigned). `None` serves everything through `fallback_from`.
+    index: Option<ResolvedIndex>,
     pool: Arc<Mutex<Vec<NeoConnection>>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     /// Present only when bulk is capped below the pool size; `None` leaves
@@ -461,8 +468,7 @@ pub(crate) fn attach_options(snapshot: Option<i64>, data_path_override: Option<&
     opts.join(", ")
 }
 
-/// Attach path for a catalog location. Shared by the serving pool and the
-/// Quack instance so both pin the same snapshot.
+/// Attach path for a catalog location.
 pub fn catalog_url(location: &str) -> String {
     format!("ducklake:{}", location.trim_end_matches('/'))
 }
@@ -489,37 +495,65 @@ const EXPECTED_FEATURE_SCHEMA: [(&str, &str); 13] = [
     ("name", "VARCHAR"),
 ];
 
-/// Resolve the serving FROM clause (see [`Store::table_from`]). Catalog-table
-/// reads carry ~16 ms of DuckLake per-query overhead versus reading the same
-/// Parquet directly at identical bytes read (measured). Our publishes are
-/// additive-only (data files never deleted or rewritten, inlined data
-/// flushed, no row deletes), so the live file list at the pinned snapshot
-/// is the whole truth and `read_parquet` over it serves identical rows
-/// without that overhead. Every guard below fails closed to catalog reads:
-/// a foreign catalog (deletes, inlined rows, evolved schema, empty table)
-/// serves exactly as before, only slower.
-fn resolve_table_source(
-    conn: &NeoConnection,
-    snapshot: i64,
-    data_override: Option<&str>,
-) -> String {
-    match table_source(conn, snapshot, data_override) {
-        Ok(from) => {
-            tracing::info!("serving reads from frozen file list");
-            from
-        }
-        Err(reason) => {
-            tracing::warn!(reason, "serving reads from catalog table");
-            "features".to_string()
-        }
+/// Files live at a snapshot, before URL resolution: the DATA base plus
+/// ordered DATA-relative paths (schema/table prefix included).
+pub(crate) struct ResolvedFiles {
+    pub base: String,
+    pub relpaths: Vec<String>,
+}
+
+/// FNV-1a 64-bit: stable across processes, no BuildHasherDoS random state.
+fn fnv1a64(s: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut h = OFFSET;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+/// Shard-owning base for one file. Empty bases mean "stored path": every
+/// file resolves against the catalog's own DATA base (local fixtures,
+/// direct-S3 baselines). Otherwise the filename hash picks a base, so each
+/// object has exactly one owning cache shard across restarts and scales.
+fn shard_base<'a>(bases: &'a [String], stored_base: &'a str, relpath: &str) -> &'a str {
+    if bases.is_empty() {
+        stored_base
+    } else {
+        let i = (fnv1a64(relpath) % bases.len() as u64) as usize;
+        bases[i].as_str()
     }
 }
 
-fn table_source(
-    conn: &NeoConnection,
-    snapshot: i64,
-    data_override: Option<&str>,
-) -> Result<String, String> {
+fn slash(s: &str) -> String {
+    if s.ends_with('/') {
+        s.to_string()
+    } else {
+        format!("{s}/")
+    }
+}
+
+/// Full read URLs for resolved files, with per-file shard assignment.
+/// Absolute paths (unverified legacy layouts) pass through unassigned,
+/// exactly as before sharding existed.
+pub(crate) fn file_urls(bases: &[String], stored_base: &str, relpaths: &[String]) -> Vec<String> {
+    relpaths
+        .iter()
+        .map(|rel| {
+            if rel.contains("://") || rel.starts_with('/') {
+                rel.clone()
+            } else {
+                format!("{}{}", slash(shard_base(bases, stored_base, rel)), rel)
+            }
+        })
+        .collect()
+}
+
+/// Ordered live files plus DATA base; all serving-source guards live here.
+/// Both the catalog-table fallback and the serving-index path build on it.
+pub(crate) fn resolve_files(conn: &NeoConnection, snapshot: i64) -> Result<ResolvedFiles, String> {
     let tid = db::int_one(
         conn,
         &format!("SELECT table_id FROM {META}.ducklake_table WHERE table_name='features'"),
@@ -645,25 +679,18 @@ fn table_source(
     if inlined > 0 {
         return Err("inlined data present".into());
     }
-    let base = match data_override {
-        Some(base) => {
-            if base.ends_with('/') {
-                base.to_string()
-            } else {
-                format!("{base}/")
-            }
-        }
-        None => {
-            let rows = db::text_table(conn, "SELECT data_path FROM ducklake_settings('shard')")
-                .map_err(|e| format!("catalog data path: {e}"))?;
-            rows.into_iter()
-                .next()
-                .and_then(|mut row| row.pop().flatten())
-                .filter(|base| !base.is_empty())
-                .ok_or_else(|| "catalog data path is empty".to_string())?
-        }
+    // The stored base travels with the file list; callers pick the
+    // effective base per file (override shards or stored path).
+    let stored = {
+        let rows = db::text_table(conn, "SELECT data_path FROM ducklake_settings('shard')")
+            .map_err(|e| format!("catalog data path: {e}"))?;
+        rows.into_iter()
+            .next()
+            .and_then(|mut row| row.pop().flatten())
+            .filter(|base| !base.is_empty())
+            .ok_or_else(|| "catalog data path is empty".to_string())?
     };
-    let mut urls = Vec::with_capacity(files.len());
+    let mut relpaths = Vec::with_capacity(files.len());
     for mut file in files {
         let mut cells = file.drain(..);
         let path = cells.next().flatten().unwrap_or_default();
@@ -671,13 +698,98 @@ fn table_source(
             .next()
             .flatten()
             .is_some_and(|flag| flag.eq_ignore_ascii_case("true"));
-        urls.push(crate::filter::quote(&if relative {
-            format!("{base}{prefix}{path}")
+        relpaths.push(if relative {
+            format!("{prefix}{path}")
         } else {
             path
-        }));
+        });
     }
-    Ok(format!("read_parquet([{}])", urls.join(",")))
+    Ok(ResolvedFiles {
+        base: stored,
+        relpaths,
+    })
+}
+
+/// Serving index with per-file absolute URLs, resolved once at open.
+struct ResolvedIndex {
+    index: crate::index::ServingIndex,
+    urls: Vec<String>,
+}
+
+/// Validate a candidate index document: version, pinned-commit match, and
+/// exact file-set agreement with freshly resolved catalog state. Anything
+/// else ignores the index (fail closed to the fallback).
+fn check_index(
+    doc: &str,
+    snapshot: i64,
+    relpaths: &[String],
+) -> Result<crate::index::ServingIndex, String> {
+    let index: crate::index::ServingIndex =
+        serde_json::from_str(doc).map_err(|e| format!("serving index parse: {e}"))?;
+    if index.version != crate::index::INDEX_VERSION {
+        return Err(format!("serving index version {}", index.version));
+    }
+    if index.ducklake_commit != snapshot {
+        return Err(format!(
+            "serving index commit {} != pinned snapshot {snapshot}",
+            index.ducklake_commit
+        ));
+    }
+    let indexed: Vec<String> = index.files.iter().map(|f| f.path.clone()).collect();
+    if indexed != relpaths {
+        return Err("serving index file set disagrees with catalog".into());
+    }
+    Ok(index)
+}
+
+/// Resolve both serving sources at open: the all-files fallback plus the
+/// pruned index when the published document checks out.
+fn resolve_serving(
+    opener: &NeoConnection,
+    cfg: &StoreConfig,
+    snapshot: i64,
+) -> (String, Option<ResolvedIndex>) {
+    let resolved = match resolve_files(opener, snapshot) {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            tracing::warn!(reason, "serving reads from catalog table");
+            return ("features".to_string(), None);
+        }
+    };
+    let all_urls = file_urls(&cfg.data_bases, &resolved.base, &resolved.relpaths);
+    let fallback_from = format!(
+        "read_parquet([{}])",
+        all_urls
+            .iter()
+            .map(|u| crate::filter::quote(u))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    tracing::info!("serving reads from frozen file list");
+    let index = match cfg.index_json.as_deref() {
+        None => {
+            tracing::info!("no serving index published; no per-request pruning");
+            None
+        }
+        Some(doc) => match check_index(doc, snapshot, &resolved.relpaths) {
+            Ok(index) => {
+                tracing::info!(
+                    files = resolved.relpaths.len(),
+                    partitions = index.partitions.len(),
+                    "serving index active"
+                );
+                Some(ResolvedIndex {
+                    index,
+                    urls: all_urls,
+                })
+            }
+            Err(reason) => {
+                tracing::warn!(reason, "ignoring serving index");
+                None
+            }
+        },
+    };
+    (fallback_from, index)
 }
 
 /// Origin (scheme + authority) of an http(s) location, with an optional
@@ -706,15 +818,6 @@ pub(crate) fn cachey_secret_sql(location: &str) -> Option<String> {
     http_origin(location).map(|origin| {
         format!(
             "CREATE OR REPLACE SECRET iron_feather_cachey (TYPE http, SCOPE {}, EXTRA_HTTP_HEADERS MAP {{'C0-Config': 'fps=true'}})",
-            crate::filter::quote(&origin)
-        )
-    })
-}
-
-pub(crate) fn cachey_secret_sql_named(name: &str, location: &str) -> Option<String> {
-    http_origin(location).map(|origin| {
-        format!(
-            "CREATE OR REPLACE SECRET {name} (TYPE http, SCOPE {}, EXTRA_HTTP_HEADERS MAP {{'C0-Config': 'fps=true'}})",
             crate::filter::quote(&origin)
         )
     })
@@ -771,15 +874,24 @@ fn setup_session(conn: &NeoConnection, cfg: &StoreConfig, _remote: bool) -> Resu
     if let Some(secret) = cachey_secret_sql(&cfg.location) {
         db::execute_all(conn, &[secret.as_str()])?;
     }
-    // The data-path override usually shares the catalog's origin (same
-    // zone Cachey); when it doesn't, scope a second secret to it so
-    // Parquet fetches carry the same request config.
-    if let Some(base) = cfg.data_path_override.as_deref() {
-        if http_origin(base) != http_origin(&cfg.location) {
-            if let Some(secret) = cachey_secret_sql_named("iron_feather_cachey_data", base) {
-                db::execute_all(conn, &[secret.as_str()])?;
+    // The data-path overrides usually share the catalog's origin (same
+    // zone Cachey); each distinct origin gets its own secret so Parquet
+    // fetches carry the same request config whichever shard owns them.
+    // A BTreeSet keeps secret creation deterministic across restarts.
+    let mut origins = std::collections::BTreeSet::new();
+    for base in &cfg.data_bases {
+        if let Some(origin) = http_origin(base) {
+            if Some(&origin) != http_origin(&cfg.location).as_ref() {
+                origins.insert(origin);
             }
         }
+    }
+    for (i, origin) in origins.into_iter().enumerate() {
+        let secret = format!(
+            "CREATE OR REPLACE SECRET iron_feather_cachey_data_{i} (TYPE http, SCOPE {}, EXTRA_HTTP_HEADERS MAP {{'C0-Config': 'fps=true'}})",
+            crate::filter::quote(&origin)
+        );
+        db::execute_all(conn, &[secret.as_str()])?;
     }
     // Direct-S3 baselines only: prod Cachey mode sets no S3 credentials.
     if let (Some(endpoint), Some(key_id), Some(secret)) = (
@@ -879,7 +991,10 @@ impl Store {
             db.set_option(&memory)?;
         }
         let catalog = catalog_url(&cfg.location);
-        let data_override = cfg.data_path_override.as_deref();
+        // The catalog attach keeps a single DATA_PATH override (first
+        // base): per-file shard URLs carry their own bases, and the rare
+        // catalog-table fallback reads through this one shard.
+        let data_override = cfg.data_bases.first().map(String::as_str);
         // Open one connection per pool slot. The ATTACH is database-level:
         // the opener attaches latest to resolve the snapshot, then detaches
         // and re-attaches pinned; every connection only switches into it.
@@ -915,8 +1030,8 @@ impl Store {
         )?;
         // Freeze the serving file list at the pinned snapshot while the
         // opener still holds the pinned attach. Falls back to the catalog
-        // table on any doubt (see resolve_table_source).
-        let table_from = resolve_table_source(&opener, snapshot, data_override);
+        // table on any doubt (see resolve_serving).
+        let (fallback_from, index) = resolve_serving(&opener, &cfg, snapshot);
         let mut pool = Vec::with_capacity(cfg.connections);
         for _ in 0..cfg.connections {
             let conn = db.connect()?;
@@ -963,7 +1078,8 @@ impl Store {
         Ok(Self {
             collections,
             snapshot,
-            table_from,
+            fallback_from,
+            index,
             pool: Arc::new(Mutex::new(pool)),
             semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.connections)),
             bulk,
@@ -1012,11 +1128,33 @@ impl Store {
         }
     }
 
-    /// FROM clause for serving reads: the frozen file list when the
-    /// snapshot's guards pass, else the catalog table. Quack does not use
-    /// this (it serves the catalog table directly).
-    pub fn table_from(&self) -> &str {
-        &self.table_from
+    /// FROM clause for a request: pruned candidate files from the serving
+    /// index, or the frozen all-files fallback when no index applies.
+    /// Empty selections read one footer through a FALSE guard (matches
+    /// nothing, opens nothing else).
+    pub fn read_source(&self, bounds: Option<[f64; 4]>) -> String {
+        let Some(resolved) = self.index.as_ref() else {
+            return self.fallback_from.clone();
+        };
+        let mut idxs = crate::index::prune_files(&resolved.index, bounds);
+        idxs.retain(|&i| i < resolved.urls.len());
+        if idxs.is_empty() {
+            // Footer-only probe of one file; matches nothing, opens nothing
+            // else. (Index file sets are never empty: generation and the
+            // open-time agreement check both require it.)
+            return match resolved.urls.first() {
+                Some(first) => format!(
+                    "(SELECT * FROM read_parquet([{}]) WHERE FALSE) AS _empty",
+                    crate::filter::quote(first)
+                ),
+                None => self.fallback_from.clone(),
+            };
+        }
+        let urls: Vec<String> = idxs
+            .iter()
+            .map(|&i| crate::filter::quote(&resolved.urls[i]))
+            .collect();
+        format!("read_parquet([{}])", urls.join(","))
     }
 
     #[allow(dead_code)]
@@ -1164,8 +1302,16 @@ impl Store {
         if let Some(hit) = self.flight_schemas.lock().unwrap().get(&projection) {
             return Ok(hit.clone());
         }
+        // The FALSE probe matches nothing; pruning is irrelevant, so it
+        // reads the fallback source directly.
         let schema = self
-            .arrow("FALSE".into(), projection.clone(), 1, 0)
+            .arrow(
+                "FALSE".into(),
+                projection.clone(),
+                self.fallback_from.clone(),
+                1,
+                0,
+            )
             .await?
             .schema;
         self.flight_schemas
@@ -1186,12 +1332,12 @@ impl Store {
         &self,
         predicate: String,
         projection: String,
+        from: String,
         limit: u32,
         offset: u32,
     ) -> Result<ArrowResult, Error> {
         let bulk = self.acquire_bulk()?;
         let projection = Self::rewrite_projection(&projection);
-        let from = self.table_from.clone();
         self.run_class(WorkClass::Interactive, move |conn| {
             let _held = bulk;
             let sql = format!(
@@ -1321,12 +1467,12 @@ impl Store {
         &self,
         predicate: String,
         projection: String,
+        from: String,
         limit: u32,
         offset: u32,
     ) -> Result<FlightBatches, Error> {
         // Rewrite the projection to use build-time derivatives.
         let projection = Self::rewrite_projection(&projection);
-        let from = self.table_from.clone();
         let sql = format!(
             "SELECT {projection} FROM (SELECT id, geom, properties, source_id, cx, cy, name FROM {from} \
              WHERE {predicate} ORDER BY id LIMIT {limit} OFFSET {offset}) AS page ORDER BY page.id"

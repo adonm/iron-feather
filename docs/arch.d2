@@ -2,20 +2,18 @@ direction: down
 source: Layercake GeoParquet (HTTPS)
 build: iron-feather build
 catalog: DuckLake catalog (small, local or S3)
+index: serving index sidecar (spatial file partitions)
 parquet: Clustered Parquet files (S3)
 pool: Shared read-only connection pool
 http: OGC Features + XYZ MVT (cached bytes)
 flight: Arrow Flight (cached native Arrow batches)
-quackdb: Separate Quack database (pinned snapshot)
-quack: Quack bulk SQL (token, filtered)
 
 source -> build: bbox-pruned range reads
 build -> catalog: atomic publish
 build -> parquet: data files first
+build -> index: per-file bboxes
 catalog -> pool
+index -> pool: candidate files per request
 parquet -> pool: range GETs
 pool -> http
 pool -> flight
-catalog -> quackdb: pinned read-only snapshot
-parquet -> quackdb: range GETs
-quackdb -> quack

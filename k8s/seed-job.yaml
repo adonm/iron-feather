@@ -29,6 +29,7 @@ spec:
             - |
               set -eu
               iron-feather build --bbox=13.35,52.48,13.45,52.55 --limit 20000 \
+                --content-address \
                 --out /stage/sha_berlin.ducklake \
                 --data-dir /stage/files \
                 --data-url 's3://lake/data/'
@@ -52,6 +53,9 @@ spec:
               rclone copy /stage/files lake:lake/data/
               if ! rclone lsf "lake:lake/catalogs/" 2>/dev/null | grep -qx "$name"; then
                 rclone copyto "/stage/$name" "lake:lake/catalogs/$name"
+              fi
+              if ! rclone lsf "lake:lake/catalogs/" 2>/dev/null | grep -qx "$name.serving.json"; then
+                rclone copyto "/stage/$name.serving.json" "lake:lake/catalogs/$name.serving.json"
               fi
               rclone rcat lake:lake/refs/latest < /stage/catalog-name
               rclone rcat lake:lake/refs/main < /stage/catalog-name

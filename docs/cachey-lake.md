@@ -15,6 +15,7 @@ s3://lake
 │   └── tags/<name>       # one tiny object per tag
 ├── catalogs/
 │   ├── sha_001.ducklake  # immutable once published; data paths are Cachey URLs
+│   ├── sha_001.ducklake.serving.json  # spatial file index for the catalog
 │   └── sha_002.ducklake
 └── data/
     └── ...               # immutable Parquet, shared across snapshots
@@ -175,8 +176,9 @@ compounding causes, both now pulled:
   `late_materialization_max_rows=0` (best-effort: DEBUG setting, warn and
   continue if a future engine renames it). Separately, catalog-table reads
   still carry ~16 ms of DuckLake per-query overhead at identical bytes
-  read, so the frozen file-list serving (`Store::table_from`, guards fail
-  closed to catalog reads) stays.
+  read, so the frozen file-list serving stays: per-request file pruning
+  from a publish-time serving index (`<catalog>.serving.json`, guards fail
+  closed to catalog reads).
 - The fixture file held a single row group (`row_group 65536` > 20k
   rows), so `xmin/xmax` zone maps pruned at file granularity only.
   Row-group default is now 8192 (measured on direct reads: 44 ms at 1
@@ -231,6 +233,39 @@ selective queries and monotonic for bulk — so 8192 stays the default
 Re-runs confirm the ordering with no min/max overlap between variants
 on small pages.
 
+25M-row file-size benchmark (same 25,358,254 rows repacked at 16/32/64 MB
+target files — id-multiset hash matches the 128 MB base on all four;
+grid order, zstd-3, 8K groups kept; ~200/100/50/25 files). 11 distinct
+warmed URLs, sequential client, p50 of 7; bodies byte-identical across
+variants on every URL, local and warm Cachey:
+
+| query | local 128 → 16 → 32 → 64 MB | warm Cachey 128 → 32 MB |
+|---|---|---|
+| dense small limit=10 (p50 each) | ~83–108 → ~23–50 → ~29–40 → ~20–36 ms | ~62–126 → ~26–34 ms |
+| dense/rural limit=100 | ~85–233 → ~28–45 → ~29–45 → ~20–45 ms | ~68–235 → ~27–60 ms |
+| bulk quarter-extent limit=1000 | 3079 → 832 → 899 → 702 ms | 3151 → 907 ms |
+| bulk full-extent limit=100 | 1520 → 288 → 365 → 342 ms | cold first touch: 1535 → 414 ms |
+
+Cold Cachey (fresh servers, empty cache, single first-touch measurement)
+shows the same shape with bigger gaps from smaller miss downloads —
+e.g. small pages ~85–302 → ~26–100 ms, bulk 3719 → 1585 ms — and warm
+agreement is byte-identical across variants on every URL.
+
+16/32/64 MB tie within ~20% on every shape (noise floor of the shared
+box) while all three beat 128 MB by 3–5× everywhere — including cold
+Cachey, where smaller files mean smaller miss downloads. So `file_mb`
+default is now 32 (middle ground on keys/footers); bulk-heavy estates can
+try 64, broad-interactive ones 16, but nothing here justifies finer than
+16 MB for serving.
+
+Publish flow notes: `build --content-address` names data files by SHA-256
+of their bytes (verified byte-deterministic across builds), so unchanged
+snapshots upload nothing new and shared caches never cold-start on
+unchanged data; the serving index (`<catalog>.serving.json`) travels with
+the catalog so readers prune without touching catalog metadata per query.
+Readers fetch the index over Cachey with closed-range GETs (bare GETs are
+400, open-ended ranges 416 — same contract as DuckDB's own fetches).
+
 Server assembly/encode is microseconds per the `ogc items render`
 `candidate_us`/`fetch_us` debug split — DuckDB time is the total.
 Concurrency leaves p50 flat while rps scales: no queueing, latency is
@@ -245,15 +280,23 @@ repeats across pods.
 
 ## Production mapping
 
-- One Cachey Deployment + Service per AZ over the same S3 bucket; each
-  zone's readers address their zone's Service, so the page cache is shared
-  zone-wide with no CSI, FUSE, or sidecars.
+- Cachey Deployments + Services per AZ per shard over the same S3 bucket
+  (`cachey.shards`, default 1); each zone's readers hash every object to
+  its owning shard (`--data-base` repeats once per shard), so the page
+  cache stays shared zone-wide with stable ownership and no CSI, FUSE, or
+  sidecars. Scale past one AZ cache by raising the shard count.
 - Only Cachey and the writer talk to S3 (writer uploads; Cachey fetches).
   Readers need no cloud credentials at all.
-- Publish = build with `--data-url s3://<bucket>/data/`, upload immutable
-  data + catalog additively (copy, never delete; catalog keys never
-  overwritten), then advance refs through the API. Hourly-or-slower
-  cadence means no distributed locking and no
+- Publish = build with `--data-url s3://<bucket>/data/` (plus
+  `--content-address` for stable keys), upload immutable data + catalog +
+  serving index additively (copy, never delete; catalog keys never
+  overwritten), then advance refs through the API. Unchanged snapshots
+  upload nothing new, so shared caches never cold-start on unchanged
+  data. Hourly-or-slower cadence means no distributed locking and no
   Nessie/Postgres/registry.duckdb: refs are tiny objects (here) or API
   rows (prod).
 - Branching is zero-copy: another ref pointing at an existing catalog.
+- Interactive OGC/MVT readers stay narrow and disposable; broad scans and
+  Arrow exports go to the dedicated bulk pool (`bulk.enabled=true`,
+  Flight exposed) pinned to the same catalog. No raw-SQL protocol ships
+  in readers: Quack was removed, Flight is the bulk protocol.

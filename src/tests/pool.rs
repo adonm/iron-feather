@@ -121,7 +121,13 @@ async fn pool_bulk_cap_sheds_flight_without_touching_ogc() {
         let worker = store.clone();
         tasks.push(tokio::spawn(async move {
             worker
-                .arrow("TRUE".into(), "id".into(), 100_000, 0)
+                .arrow(
+                    "TRUE".into(),
+                    "id".into(),
+                    worker.read_source(None),
+                    100_000,
+                    0,
+                )
                 .await
                 .map(|_| ())
         }));
@@ -276,10 +282,10 @@ async fn data_path_override_redirects_relative_reads() {
     let catalog = fixture.catalog.clone();
     let files = fixture._dir.path().join("files");
     assert!(files.join("main").exists());
-    let open = |data_path_override: Option<String>| {
+    let open = |data_bases: Vec<String>| {
         Store::open_config(StoreConfig {
             location: catalog.clone(),
-            data_path_override,
+            data_bases,
             connections: 1,
             max_waiters: 0,
             max_wait: std::time::Duration::ZERO,
@@ -291,7 +297,7 @@ async fn data_path_override_redirects_relative_reads() {
         })
     };
     // Sanity: stored DATA_PATH serves without an override.
-    let plain = open(None).unwrap();
+    let plain = open(Vec::new()).unwrap();
     // Force a real data read (count(*) can be answered from metadata).
     let len = plain
         .run(|conn| {
@@ -306,14 +312,14 @@ async fn data_path_override_redirects_relative_reads() {
     let empty = fixture._dir.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
     let empty_override = format!("{}/", empty.to_str().unwrap());
-    assert!(open(Some(empty_override)).is_err());
+    assert!(open(vec![empty_override]).is_err());
     // Copy data aside, remove the original, override to the copy: reads
     // must succeed via the override alone.
     let copy = fixture._dir.path().join("files-copy");
     copy_dir(&files, &copy);
     std::fs::remove_dir_all(&files).unwrap();
     let copy_override = format!("{}/", copy.to_str().unwrap());
-    let redirected = open(Some(copy_override)).unwrap();
+    let redirected = open(vec![copy_override]).unwrap();
     let len = redirected
         .run(|conn| {
             crate::db::text_table(conn, "SELECT id FROM features ORDER BY id LIMIT 1")

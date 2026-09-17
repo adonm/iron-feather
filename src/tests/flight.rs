@@ -149,7 +149,13 @@ async fn streaming_drop_before_schema_does_not_strand_the_pool() {
     // Start a stream and drop it immediately (before/without reading
     // schema): cancellation must return the connection promptly.
     let batches = store
-        .arrow_stream("TRUE".into(), "id".into(), 100_000, 0)
+        .arrow_stream(
+            "TRUE".into(),
+            "id".into(),
+            store.read_source(None),
+            100_000,
+            0,
+        )
         .await
         .unwrap();
     drop(batches);
@@ -170,7 +176,13 @@ async fn streaming_slow_reader_still_completes_under_budgets() {
     let fixture = Fixture::new(2);
     let mut batches = fixture
         .store
-        .arrow_stream("TRUE".into(), "id".into(), 100_000, 0)
+        .arrow_stream(
+            "TRUE".into(),
+            "id".into(),
+            fixture.store.read_source(None),
+            100_000,
+            0,
+        )
         .await
         .unwrap();
     let mut count = 0;
@@ -194,7 +206,13 @@ async fn streaming_reports_mid_stream_failure_as_error() {
     // never as a silently truncated stream.
     let result = fixture
         .store
-        .arrow_stream("TRUE".into(), "no_such_column".into(), 100_000, 0)
+        .arrow_stream(
+            "TRUE".into(),
+            "no_such_column".into(),
+            fixture.store.read_source(None),
+            100_000,
+            0,
+        )
         .await;
     assert!(result.is_err());
     fixture.store.run(|_| Ok(())).await.unwrap();
@@ -208,7 +226,13 @@ async fn streaming_drop_with_queued_batches_releases_budget() {
     let fixture = Fixture::new(1);
     let store = fixture.store.clone();
     let batches = store
-        .arrow_stream("TRUE".into(), "id".into(), 100_000, 0)
+        .arrow_stream(
+            "TRUE".into(),
+            "id".into(),
+            store.read_source(None),
+            100_000,
+            0,
+        )
         .await
         .unwrap();
     // Wait for the worker to queue at least one batch (budget held).
@@ -250,7 +274,13 @@ async fn oversized_batch_drains_instead_of_spinning() {
     let fixture = Fixture::new(1);
     let mut batches = fixture
         .store
-        .arrow_stream("TRUE".into(), "id".into(), 100_000, 0)
+        .arrow_stream(
+            "TRUE".into(),
+            "id".into(),
+            fixture.store.read_source(None),
+            100_000,
+            0,
+        )
         .await
         .unwrap();
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), batches.batches.recv())

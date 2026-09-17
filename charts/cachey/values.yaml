@@ -5,6 +5,14 @@ zones:
   - az-a
   - az-b
 
+# Consistent-hash cache shards per zone. Each object has exactly one owning
+# shard (readers hash the filename), so adding shards splits the working
+# set instead of duplicating it. Services are <fullname>-cachey-<zone>-s<i>
+# with one hostPath dir each. Scale past one AZ cache by raising this and
+# reinstalling; readers learn the count from the iron-feather chart
+# (its `cachey.shards` must match).
+shards: 1
+
 images:
   # Pinned by digest; refresh deliberately (see docs/cachey-lake.md).
   cachey: ghcr.io/s2-streamstore/cachey@sha256:beab43f996c0d183d4c3adb68257d342ef87d700befe5b30c196f8a1524b96ca
@@ -40,5 +48,5 @@ backend:
   authUser: devkey
   authPassword: devsecret123
 
-# Per-zone Service names are <fullname>-cachey-<zone>; readers address
-# http://<that>/fetch/<bucket>/<key> with plain ranged GETs.
+# Per-zone per-shard Service names are <fullname>-cachey-<zone>-s<i>;
+# readers address http://<that>/fetch/<bucket>/<key> with plain ranged GETs.

@@ -9,4 +9,3 @@ mod materialize;
 mod ogc;
 mod plan;
 mod pool;
-mod quack;

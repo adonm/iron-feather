@@ -123,15 +123,17 @@ step "build v1 catalog with zone-independent s3:// DATA_PATH"
 cargo run --locked --manifest-path "$ROOT/Cargo.toml" -- build \
   --from "$WORK/source.parquet" --collection buildings --bbox="$BBOX" \
   --out "$WORK/v1.ducklake" --data-dir "$WORK/files" \
-  --data-url "s3://$BUCKET/data/" --file-mb 8 --source-id 1
-# Additive publish only: data first, then the catalog, then the ref.
-# Catalog keys are never overwritten; data files are never deleted.
+  --data-url "s3://$BUCKET/data/" --file-mb 8 --source-id 1 --content-address
+# Additive publish only: data first, then the catalog + serving index that
+# reference them, then the ref. Catalog keys are never overwritten; data
+# files are never deleted.
 if rclone lsf "stack:$BUCKET/catalogs/" 2>/dev/null | grep -qx v1.ducklake; then
   echo "catalog key v1.ducklake already published" >&2
   exit 1
 fi
 rclone copy "$WORK/files" "stack:$BUCKET/data/"
 rclone copyto "$WORK/v1.ducklake" "stack:$BUCKET/catalogs/v1.ducklake"
+rclone copyto "$WORK/v1.ducklake.serving.json" "stack:$BUCKET/catalogs/v1.ducklake.serving.json"
 printf '%s' v1.ducklake | rclone rcat "stack:$BUCKET/refs/latest"
 python3 - <<'EOF'
 import json, subprocess
@@ -148,10 +150,11 @@ step "serve reader A (zone A Cachey for catalog + data)"
 cargo run --locked --release --manifest-path "$ROOT/Cargo.toml" -- serve \
   --shard "$CACHEY_A/fetch/$BUCKET/catalogs/v1.ducklake" \
   --data-base "$CACHEY_A/fetch/$BUCKET/data/" \
-  --listen 127.0.0.1:3211 --flight-listen 127.0.0.1:5211 --no-quack \
+  --listen 127.0.0.1:3211 --flight-listen 127.0.0.1:5211 \
   >"$WORK/serve-a.log" 2>&1 &
 SERVERS="$SERVERS $!"
 wait_for "http://127.0.0.1:3211/healthz"
+grep -q "serving index active" "$WORK/serve-a.log" || { echo "reader A did not activate the serving index" >&2; exit 1; }
 
 step "reader A: discovery, full walks, bbox ground truth, tiles"
 python3 - http://127.0.0.1:3211 "$WORK" <<'EOF'
@@ -262,7 +265,7 @@ echo "cachey A before B: successful_downloads=$dl_before hits=$hits_before"
 cargo run --locked --release --manifest-path "$ROOT/Cargo.toml" -- serve \
   --shard "$CACHEY_A/fetch/$BUCKET/catalogs/v1.ducklake" \
   --data-base "$CACHEY_A/fetch/$BUCKET/data/" \
-  --listen 127.0.0.1:3212 --flight-listen 127.0.0.1:5212 --no-quack \
+  --listen 127.0.0.1:3212 --flight-listen 127.0.0.1:5212 \
   >"$WORK/serve-b.log" 2>&1 &
 SERVERS="$SERVERS $!"
 wait_for "http://127.0.0.1:3212/healthz"
@@ -292,7 +295,7 @@ dl_a_before=$(cachey_successful_downloads "$CACHEY_A")
 cargo run --locked --release --manifest-path "$ROOT/Cargo.toml" -- serve \
   --shard "$CACHEY_B/fetch/$BUCKET/catalogs/v1.ducklake" \
   --data-base "$CACHEY_B/fetch/$BUCKET/data/" \
-  --listen 127.0.0.1:3213 --flight-listen 127.0.0.1:5213 --no-quack \
+  --listen 127.0.0.1:3213 --flight-listen 127.0.0.1:5213 \
   >"$WORK/serve-c.log" 2>&1 &
 SERVERS="$SERVERS $!"
 wait_for "http://127.0.0.1:3213/healthz"
@@ -322,21 +325,23 @@ step "publish v2 (small box) additively and prove reader A is pinned"
 cargo run --locked --manifest-path "$ROOT/Cargo.toml" -- build \
   --from "$WORK/source.parquet" --collection buildings --bbox="2.0,48.0,2.1,48.1" \
   --out "$WORK/v2.ducklake" --data-dir "$WORK/files2" \
-  --data-url "s3://$BUCKET/data/" --file-mb 8 --source-id 1
+  --data-url "s3://$BUCKET/data/" --file-mb 8 --source-id 1 --content-address
 if rclone lsf "stack:$BUCKET/catalogs/" 2>/dev/null | grep -qx v2.ducklake; then
   echo "catalog key v2.ducklake already published" >&2
   exit 1
 fi
 rclone copy "$WORK/files2" "stack:$BUCKET/data/"
 rclone copyto "$WORK/v2.ducklake" "stack:$BUCKET/catalogs/v2.ducklake"
+rclone copyto "$WORK/v2.ducklake.serving.json" "stack:$BUCKET/catalogs/v2.ducklake.serving.json"
 printf '%s' v2.ducklake | rclone rcat "stack:$BUCKET/refs/latest"
 cargo run --locked --release --manifest-path "$ROOT/Cargo.toml" -- serve \
   --shard "$CACHEY_A/fetch/$BUCKET/catalogs/v2.ducklake" \
   --data-base "$CACHEY_A/fetch/$BUCKET/data/" \
-  --listen 127.0.0.1:3214 --flight-listen 127.0.0.1:5214 --no-quack \
+  --listen 127.0.0.1:3214 --flight-listen 127.0.0.1:5214 \
   >"$WORK/serve-v2.log" 2>&1 &
 SERVERS="$SERVERS $!"
 wait_for "http://127.0.0.1:3214/healthz"
+grep -q "serving index active" "$WORK/serve-v2.log" || { echo "reader v2 did not activate the serving index" >&2; exit 1; }
 python3 - <<'EOF'
 import json
 import sys
@@ -379,7 +384,7 @@ wait_for "http://127.0.0.1:$CACHEY_A_PORT/stats"
 cargo run --locked --release --manifest-path "$ROOT/Cargo.toml" -- serve \
   --shard "$CACHEY_A/fetch/$BUCKET/catalogs/v1.ducklake" \
   --data-base "$CACHEY_A/fetch/$BUCKET/data/" \
-  --listen 127.0.0.1:3215 --flight-listen 127.0.0.1:5215 --no-quack \
+  --listen 127.0.0.1:3215 --flight-listen 127.0.0.1:5215 \
   >"$WORK/serve-d.log" 2>&1 &
 SERVERS="$SERVERS $!"
 wait_for "http://127.0.0.1:3215/healthz"

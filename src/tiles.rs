@@ -33,7 +33,7 @@ pub async fn tile(
     // SQL builds per request; validation runs before any database work.
     // Tiles hold up to 5k features and run Mercator transforms, so they
     // share the bulk lane with Flight.
-    let from = store.table_from().to_string();
+    let from = store.read_source(Some(bbox));
     let body = store
         .run_bytes(true, move |conn| {
             // Single scan: the HAVING maps empty tiles to zero rows

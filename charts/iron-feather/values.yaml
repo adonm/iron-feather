@@ -36,17 +36,26 @@ dataPrefix: data
 
 # S3 endpoint + Secret for the writer/seed upload sidecars. Defaults address
 # the bundled MinIO; point at real S3 when cachey.enabled=false.
-# cacheyUrlBase overrides the per-zone Cachey base readers use
-# (default: this release's zone Services).
+# cacheyUrlBase overrides the per-zone Cachey bases readers use with one
+# externally managed base (single shard; default: this release's zone
+# shard Services). Shard count lives in the cachey subchart
+# (`--set cachey.shards=N`); readers derive one --data-base per shard.
 s3endpoint: ""
 s3secret: ""
 cacheyUrlBase: ""
 
-# Quack bulk protocol. Off by default in the wide reader fleet: it opens a
-# second DuckDB database with its own engine budgets per pod. Enable on
-# dedicated bulk pods (or locally) instead.
-quack:
+# Dedicated bulk pool (Flight + heavy OGC) pinned to the same catalog.
+# Disabled by default: enable when bulk scans threaten interactive pages.
+# Bulk pods carry no bulk-concurrency cap so large scans flow; the
+# interactive pool serves HTTP only, so bulk Flight must go here.
+# Flight is the bulk protocol (Quack was removed); the Service exposes
+# both HTTP and Flight.
+bulk:
   enabled: false
+  replicasPerZone: 1
+  flightConcurrency: 0
+  connections: 4
+  resources: {}
 
 # Optional single writer: hourly build + S3 upload + ref move (the ETL
 # publisher). The only component allowed to mutate refs. Needs the S3

@@ -100,12 +100,15 @@ lake-publish sha *args: cachey-up
       echo "catalog key $name already published; refusing to overwrite" >&2
       exit 1
     fi
-    cargo run --locked -- build --out "$STAGE/$name" \
+    cargo run --locked -- build --out "$STAGE/$name" --content-address \
       --data-dir "$STAGE/files" --data-url "s3://lake/data/" {{args}}
     # Additive only: copy new files, never delete. Publication order is
     # data first, then the catalog that references them, then the ref move.
+    # The serving index travels with the catalog so readers prune to
+    # candidate files without touching catalog metadata per query.
     rclone copy "$STAGE/files" lake:lake/data/
     rclone copyto "$STAGE/$name" "lake:lake/catalogs/$name"
+    rclone copyto "$STAGE/$name.serving.json" "lake:lake/catalogs/$name.serving.json"
     bash scripts/lake_ref.sh set "$name" latest
     bash scripts/lake_ref.sh list
 

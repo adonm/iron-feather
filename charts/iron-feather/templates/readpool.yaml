@@ -1,14 +1,17 @@
 {{- /* One Deployment per zone behind a shared Service. Each pod pins to the
      concrete catalog in .Values.catalog and fetches its catalog bytes plus
-     Parquet ranges through its zone's Cachey: the catalog URL is zone-local
-     and --data-base overrides the catalog's zone-independent DATA_PATH to
-     the same zone Cachey, so no zone reads through another zone.
-     Readers wait for the first publish instead of crash-looping. */ -}}
+     Parquet ranges through its zone's Cachey shards: --data-base repeats
+     once per shard and the server hashes each object to its owning shard,
+     so no zone reads through another zone and shard ownership is stable
+     across restarts and scales. A cacheyUrlBase override means one
+     externally managed base (single shard). Readers wait for the first
+     publish instead of crash-looping. */ -}}
+{{- $shards := until (($.Values.cachey.shards | default 1) | int) }}
 {{- range $zone := .Values.zones }}
-{{- $zoneBase := $.Values.cacheyUrlBase | default (printf "http://%s-cachey-%s" (include "ifeather.fullname" $) $zone) }}
-{{- $cachey := printf "%s/fetch/%s" $zoneBase $.Values.s3bucket }}
+{{- $bases := list }}
+{{- if $.Values.cacheyUrlBase }}{{ $bases = append $bases $.Values.cacheyUrlBase }}{{ else }}{{ range $i := $shards }}{{ $bases = append $bases (printf "http://%s-cachey-%s-s%d" (include "ifeather.fullname" $) $zone $i) }}{{ end }}{{ end }}
+{{- $cachey := printf "%s/fetch/%s" (index $bases 0) $.Values.s3bucket }}
 {{- $shard := printf "%s/catalogs/%s" $cachey $.Values.catalog }}
-{{- $dataBase := printf "%s/%s/" $cachey $.Values.dataPrefix }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -50,7 +53,7 @@ spec:
           command:
             - sh
             - -c
-            - exec iron-feather serve --shard '{{ $shard }}' --data-base '{{ $dataBase }}' --listen 0.0.0.0:3000{{ if not $.Values.quack.enabled }} --no-quack{{ end }}
+            - exec iron-feather serve --shard '{{ $shard }}'{{ range $b := $bases }} --data-base '{{ $b }}/fetch/{{ $.Values.s3bucket }}/{{ $.Values.dataPrefix }}/'{{ end }} --listen 0.0.0.0:3000
           ports:
             - name: http
               containerPort: 3000

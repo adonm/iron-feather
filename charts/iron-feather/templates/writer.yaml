@@ -43,6 +43,7 @@ spec:
                   iron-feather build --bbox={{ .Values.writer.bbox }} \
                     --limit {{ .Values.writer.limit }} \
                     --collection {{ .Values.writer.collection }} \
+                    --content-address \
                     --out "/stage/$sha.ducklake" \
                     --data-dir /stage/files \
                     --data-url 's3://{{ .Values.s3bucket }}/{{ .Values.dataPrefix }}/'
@@ -63,8 +64,11 @@ spec:
                     exit 1
                   fi
                   # Additive only: never delete data another snapshot references.
+                  # Content-addressed names make unchanged snapshots upload
+                  # nothing new (rclone skips existing keys).
                   rclone copy /stage/files "lake:{{ .Values.s3bucket }}/{{ .Values.dataPrefix }}/"
                   rclone copyto "/stage/$name" "lake:{{ .Values.s3bucket }}/catalogs/$name"
+                  rclone copyto "/stage/$name.serving.json" "lake:{{ .Values.s3bucket }}/catalogs/$name.serving.json"
                   rclone rcat "lake:{{ .Values.s3bucket }}/refs/latest" < /stage/catalog-name
                   echo "published $name"
               env:

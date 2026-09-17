@@ -53,6 +53,7 @@ pub struct ShardFlight {
 struct Planned {
     predicate: String,
     projection: String,
+    bounds: Option<[f64; 4]>,
 }
 
 impl ShardFlight {
@@ -100,6 +101,7 @@ impl ShardFlight {
         Ok(Planned {
             predicate,
             projection: select.join(", "),
+            bounds: bbox,
         })
     }
 
@@ -206,11 +208,13 @@ impl FlightService for ShardFlight {
         // carries a budget permit that releases on drop, so queued but
         // unconsumed batches cannot strand budget on disconnect.
         let planned = self.plan(&ticket, header)?;
+        let from = self.store.read_source(planned.bounds);
         let batches = self
             .store
             .arrow_stream(
                 planned.predicate,
                 planned.projection,
+                from,
                 ticket.limit.unwrap_or(10_000),
                 ticket.offset,
             )
