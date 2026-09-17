@@ -58,13 +58,19 @@ Components (all local, all ephemeral under `/tmp/opencode`):
 All images are pinned by digest (charts values, `scripts/cachey_up.sh`);
 refresh deliberately.
 
-`SLOW_S3_MS=30 just cachey-up` routes Cachey's S3 traffic through a
-toxiproxy adding ~30 ms downstream latency, so misses cost a realish RTT
+`SLOW_S3_MS=300 just cachey-up` routes Cachey's S3 traffic through a
+toxiproxy adding ~300 ms downstream latency, so misses cost a realish RTT
 while hits stay loopback-fast — the honest way to compare cached vs
-uncached paths locally. Measured on the 20k Berlin snapshot (8 conns,
-jittered misses): uncached 22 rps / p50 336 ms / p99
-779 ms vs Cachey-warm 106 rps / p50 71 ms / p99 106 ms. Without the proxy
-the same comparison is 44 vs 87 rps: loopback flatters the uncached path.
+uncached paths locally. 300 ms is a sustained worst case, not the average:
+same-region S3 Standard GETs typically land 50–200 ms with p99s in the
+low hundreds of ms, and cross-region adds another 150–300 ms; only
+throttling backoff (seconds, 503s) sits beyond it, and that is a retry
+regime rather than a steady benchmark. Measured on a fresh 20k Berlin
+snapshot (8 conns, 500 unique jittered misses, single local server):
+uncached 9 rps / p50 802 ms / p99 1670 ms vs Cachey-warm 145 rps /
+p50 46 ms / p99 124 ms — a ~16x throughput gap at worst-case latency.
+Without the proxy the same comparison is 44 vs 87 rps: loopback flatters
+the uncached path.
 
 Verified 2026-09-17: ranged GETs serve Parquet through Cachey (miss then
 hit per `C0-Status`); a 20k-feature Berlin snapshot serves OGC + MVT straight
@@ -118,16 +124,22 @@ Findings (verified, not assumed):
   never rewritten — keep that invariant (same as today's "never delete
   referenced files").
 
-## Benchmark: kind (Berlin 20k, mixed 500 unique)
+## Benchmark: Berlin 20k, mixed 500 unique (slow S3, 300 ms miss RTT)
 
-kind, 2 pods (port-forward fans out), MinIO backend. Loopback kind numbers
-vary with host contention, so the stable, quotable comparison is slow-S3
-(`SLOW_S3_MS=30`, realish miss RTT):
+Single local server, MinIO backend through the latency proxy, 8 conns,
+one pass over the workload per row:
 
-| path (8 conns, jittered misses) | rps | p50 | p99 |
+| path | rps | p50 | p99 |
 |---|---|---|---|
-| uncached over slow S3 | 22 | 336 ms | 779 ms |
-| Cachey-warm over slow S3 | 106 | 71 ms | 106 ms |
+| uncached (direct range GETs, every miss pays) | 9 | 802 ms | 1670 ms |
+| Cachey cold (fresh server + empty Cachey, first pass) | 128 | 46 ms | 364 ms |
+| Cachey warm (immediate repeat pass) | 145 | 46 ms | 124 ms |
+
+0 rejected, 0 errors throughout. Notes: the working set (~4 MB) fills
+Cachey within the first request wave, so cold-vs-warm differs only in
+p99 (single-miss cost) while p50 sits on the DuckDB compute floor;
+uncached pays the miss on nearly every request. Wipe Cachey (restart the
+container; memory-only in this rig) plus a fresh server for a true cold.
 
 On loopback, fetch cost nearly vanishes and DuckDB compute dominates:
 cold Cachey runs ~134 rps / p50 47 ms, warm Cachey ~140-150 rps — the
