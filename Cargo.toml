@@ -31,7 +31,6 @@ martin-tile-utils = "0.7"
 duckdb-neo = { git = "https://github.com/duckdb/duckdb-rs", rev = "fdd481e7fbc5fa4e59a715431ffa9d40c94b5956", default-features = false }
 # Raw v2 bindings for the cross-thread interrupt handle (stable ABI).
 libduckdb-sys = { git = "https://github.com/duckdb/duckdb-rs", rev = "fdd481e7fbc5fa4e59a715431ffa9d40c94b5956", default-features = false, features = ["capi-v2"] }
-moka = { version = "0.12", features = ["future"] }
 tonic = "0.14"
 # Match duckdb's Arrow major so batches pass directly into Flight.
 arrow-flight = "59"

@@ -9,7 +9,12 @@
 > The `--duck-disk-cache-dir` experiment below is also gone (`cache_httpfs`
 > has no 2.0 build), and the remaining app-level storage tuning (HTTP/Parquet
 > metadata caches, `NO_VALIDATION`) is gone too: all block/metadata caching
-> now lives in ZeroFS below the mount (see `docs/zerofs-lake.md`). All DuckDB
+> now lives in Cachey, the per-zone page cache (see `docs/cachey-lake.md`).
+> The in-app Moka response cache (`--cache-mb`, `cache_hits`/`cache_computes`
+> counters) was later removed outright: at hundreds of pods duplicated
+> per-pod response bytes are waste next to zone-shared Cachey, so every
+> request executes and repeated storage reads are absorbed below. Numbers
+> below that quote app-cache hits are historical. All DuckDB
 > access since runs through the stable v2 C API, and Quack serves the pinned
 > snapshot as the bulk protocol (see README). Re-run the matrix on the
 > nightly before quoting ratios.
@@ -46,7 +51,7 @@ in half to hit the 10 GB target. Region sizing rule of thumb from the earlier
 | scatter | 3000 fixed-seed points, mixed sizes/limits (misses) |
 | broad | quarter/full-region slices, limits 100/1000 (heavy) |
 | empty | North Sea windows (empty-result path, reported separately) |
-| deep | full-region offsets 1000/5000/10000 (traversal; pair with `--cache-mb 0`) |
+| deep | full-region offsets 1000/5000/10000 (traversal; pair with a cold Cachey) |
 | mixed | long-tail combination of the above |
 
 Window sizes are ~100 m / 1 km / 10 km. `http_bench` reports `nonempty`
@@ -145,12 +150,11 @@ hit rates.
 
 ## /metrics
 
-`GET /metrics` reports `cache_entries`, `cache_weight_bytes`,
-`cache_requests`, `cache_hits` (fast-path + coalesced waiters; hit rate =
-`hits / requests`), `cache_computes` (distinct miss executions) and
-`cache_evictions`. Sample before/after a run to size `--cache-mb`. With
-cache disabled, hits are coalesced waiters only (native urban run above:
-93,105 requests, 35,974 coalesced hits, 57,131 computes).
+`GET /metrics` reports `http_requests` plus `duck_setting_*` engine
+budgets (threads, memory). It used to also report the removed app-cache
+counters (`cache_requests`, `cache_hits`, `cache_computes`,
+`cache_evictions`); size Cachey instead via its own `/metrics`
+(page requests, downloads, hits).
 
 ## DuckLake + Parquet layout vs single .duckdb over S3
 
@@ -272,11 +276,11 @@ throughput/tail, native wins tiny/sparse/empty medians.
   oversized batches drain instead of spinning, iterator advancement is
   inside the panic boundary, and mid-stream failures surface as errors.
 - Normalized request planning (`src/plan.rs`): items/tiles/Flight share
-  pagination, cache-key and heaviness rules. Heavy pages
+  pagination and heaviness rules. Heavy pages
   (`limit > 100`, `offset >= 1000`, broad slices) share the bulk lane with
-  Flight; SQL builds on miss for items, single features and tiles.
+  Flight; SQL builds per request for items, single features and tiles.
 - Budgets are explicit (`StoreConfig`): shared DuckDB threads/memory,
-  pool queue, response-cache bytes, per-stream (`--flight-stream-mb`) and
+  pool queue, per-stream (`--flight-stream-mb`) and
   process-wide (`--flight-total-mb`) Flight buffers, plus HTTP/Flight
   execution deadlines (`--query-timeout-ms`).
 - Immutable builds carry serving work: native and DuckLake builders write
@@ -284,9 +288,9 @@ throughput/tail, native wins tiny/sparse/empty medians.
   atomically (DuckLake stages then renames; never deletes a published
   catalog first).
 
-## Warm cache: backend-independent
+## Warm cache: backend-independent (historical: pre app-cache removal)
 
-Fresh servers with `--cache-mb 256`, current code:
+Fresh servers with `--cache-mb 256`, then-current code:
 
 | Workload | single .duckdb | lake, remote catalog |
 |---|---|---|
@@ -303,17 +307,17 @@ Verdict: for 10 GB S3 serving, DuckLake with sorted Parquet beats the
 single indexed file on throughput, tail latency, bytes per miss and memory
 stability. Keep the spatially grouped insertion order (the Hilbert
 counter-example above applies here as well: pruning lives or dies by file
-statistics), keep `--cache-mb 0` runs in the matrix to watch the miss path,
+statistics), keep cold-Cachey runs in the matrix to watch the miss path,
 and re-run `just bench-layouts` against real-region S3 before committing:
 loopback excludes round-trip time, which multiplies the GET-count advantage
 further.
 
-## DuckDB HTTP/S3 caching: superseded by ZeroFS
+## DuckDB HTTP/S3 caching: superseded by Cachey
 
 The matrix below (loopback rclone S3, 8 conns, `--cache-mb 0`, urban 126
 urls) motivated the old app-level tuning, which has since been removed:
-all block/metadata caching now lives in ZeroFS below the mount
-(`docs/zerofs-lake.md`). Kept as a sizing record — the durable finding is
+all block/metadata caching now lives in Cachey, the per-zone page cache
+(`docs/cachey-lake.md`). Kept as a sizing record — the durable finding is
 that the **DuckDB memory budget dominates** (1 GiB thrashes; 4 GiB holds the
 urban working set), hence the `--memory-mb` default of 4096.
 

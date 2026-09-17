@@ -1,6 +1,0 @@
-apiVersion: v2
-name: zerofs
-description: AZ-local ZeroFS cache layer over S3 plus the upstream CSI driver
-type: application
-version: 0.1.0
-appVersion: 2.3.3

@@ -25,9 +25,12 @@ pub struct Build {
     /// Local directory receiving the Parquet data files.
     #[arg(long, default_value = "fixtures/osm.files")]
     pub data_dir: PathBuf,
-    /// URL prefix the Parquet files will be served from. Defaults to the
-    /// data dir so a local build serves immediately; pass the S3/HTTPS
-    /// prefix when publishing, then sync the data dir there.
+    /// URL prefix the Parquet files will be served from: baked into the
+    /// catalog as each file's location, so readers need no shared
+    /// filesystem (point it at the Cachey `/fetch/` prefix or S3).
+    /// Defaults to the absolute local data dir so a local build serves
+    /// immediately; sync the data dir to S3/HTTPS afterwards when
+    /// publishing remotely.
     #[arg(long)]
     pub data_url: Option<String>,
     /// Optional cap for development slices; omit to materialize the whole bbox.
@@ -45,6 +48,43 @@ pub struct Build {
     pub sort: String,
     #[arg(long, default_value_t = 1)]
     pub source_id: i64,
+}
+
+/// Rewrite the staging-absolute data file paths DuckLake recorded at write
+/// time to the portable publish root (local dir or http(s)/s3 URL). Runs
+/// after the catalog is renamed into place, before staging is removed.
+fn repoint_data_paths(
+    catalog: &str,
+    staging_data: &str,
+    data_root: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let staging_root = if staging_data.ends_with('/') {
+        staging_data.to_string()
+    } else {
+        format!("{staging_data}/")
+    };
+    let db = db::open_memory()?;
+    let conn = db.connect()?;
+    if db::execute_all(&conn, &["LOAD ducklake"]).is_err() {
+        db::execute_all(&conn, &["INSTALL ducklake", "LOAD ducklake"])?;
+    }
+    let catalog_sql = filter::quote(&format!("ducklake:{catalog}"));
+    let update = format!(
+        "UPDATE __ducklake_metadata_lake.ducklake_data_file SET path = {} || substr(path, {} + 1) \
+         WHERE path LIKE {}",
+        filter::quote(data_root),
+        staging_root.len(),
+        filter::quote(&format!("{staging_root}%")),
+    );
+    db::execute_all(
+        &conn,
+        &[
+            &format!("ATTACH {catalog_sql} AS lake"),
+            "USE lake",
+            update.as_str(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn publish_tree(source: &Path, dest: &Path) -> std::io::Result<()> {
@@ -84,13 +124,36 @@ impl Build {
         let staging_catalog = staging.path().join("catalog.ducklake");
         let staging_data = staging.path().join("files");
         std::fs::create_dir_all(&staging_data)?;
-        let data_url = self.data_url.clone().unwrap_or_else(|| {
-            let mut url = self.data_dir.to_string_lossy().into_owned();
-            if !url.ends_with('/') {
-                url.push('/');
+        // Portable data root: absolute local dirs keep serving after the
+        // staging dir below is removed; http(s)/s3 URLs let readers fetch
+        // through a range cache (e.g. Cachey) with no shared filesystem.
+        let data_url = match self.data_url.clone() {
+            Some(url) if url.contains("://") => {
+                if url.ends_with('/') {
+                    url
+                } else {
+                    format!("{url}/")
+                }
             }
-            url
-        });
+            Some(path) => {
+                let mut abs = std::path::absolute(&path)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(path);
+                if !abs.ends_with('/') {
+                    abs.push('/');
+                }
+                abs
+            }
+            None => {
+                let mut abs = std::path::absolute(&self.data_dir)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| self.data_dir.to_string_lossy().into_owned());
+                if !abs.ends_with('/') {
+                    abs.push('/');
+                }
+                abs
+            }
+        };
         let rows = self.write(&staging_catalog, &staging_data, &data_url)?;
         // Publish data files first, then the catalog that references them.
         // Existing published files are never deleted: another snapshot may
@@ -99,6 +162,14 @@ impl Build {
         std::fs::create_dir_all(&self.data_dir)?;
         publish_tree(&staging_data, &self.data_dir)?;
         std::fs::rename(&staging_catalog, &self.out)?;
+        // DuckLake records the staging absolute paths at write time; repoint
+        // them at the portable root so the catalog serves from its published
+        // location (local dir, S3, or Cachey URL) after staging is removed.
+        repoint_data_paths(
+            &self.out.to_string_lossy(),
+            &staging_data.to_string_lossy(),
+            &data_url,
+        )?;
         // Versioned manifest travels atomically with the shard so servers
         // can verify the snapshot and clients can reason about layout.
         let built_at = std::time::SystemTime::now()

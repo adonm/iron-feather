@@ -44,11 +44,11 @@ fixture-verify shard="fixtures/nw-europe.ducklake":
 workloads region="2,48,6,54" dir="workloads/nw-europe":
     python3 scripts/make_workload.py --region {{quote(region)}} --out-dir {{quote(dir)}}
 
-# Reproducible benchmark contract: fresh process, warm engine, warm cache.
-# Fresh: new server with --cache-mb 0. Warm engine: complete workload once
-# with --cache-mb 0, then measure. Warm cache: --cache-mb 256, pre-populate
-# with --passes, then measure. Alternate backend order between repeats and
-# record S3 GETs (scripts/s3_stats.py), rows, latency and peak RSS.
+# Reproducible benchmark contract: fresh process, warm engine, warm Cachey.
+# Fresh: new server. Warm engine: complete workload once, then measure.
+# Warm storage: pre-populate Cachey with one pass, then measure. Alternate
+# backend order between repeats and record S3 GETs (scripts/s3_stats.py),
+# rows, latency and peak RSS.
 bench-matrix base="http://127.0.0.1:3000" dir="workloads/nw-europe" passes="2":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -58,54 +58,58 @@ bench-matrix base="http://127.0.0.1:3000" dir="workloads/nw-europe" passes="2":
       echo "=== $file ({{passes}} passes) ==="
       cargo run --locked --release --example http_bench -- --base "$base" --concurrency 8 --passes {{passes}} --warmup-secs 2 --workload "$wdir/$file.txt"
     done
-    echo "=== broad/deep (cache-mb 0, 1 pass) ==="
+    echo "=== broad/deep (1 pass, cold storage) ==="
     cargo run --locked --release --example http_bench -- --base "$base" --concurrency 4 --passes 1 --warmup-secs 0 --workload "$wdir/broad.txt"
     cargo run --locked --release --example http_bench -- --base "$base" --concurrency 4 --passes 1 --warmup-secs 0 --workload "$wdir/deep.txt"
 
-# --- ZeroFS lake rig -------------------------------------------------------
-# Local rehearsal of the AZ-local cache design (see docs/zerofs-lake.md):
-# Garage (S3) + Redis fencing + ZeroFS 9P + FUSE mount at /tmp/opencode.
-# All block/metadata caching lives in ZeroFS; serve reads plain local paths.
+# --- Cachey lake rig -------------------------------------------------------
+# Local rehearsal of the AZ-local cache design (see docs/cachey-lake.md):
+# MinIO (S3) + Cachey (per-zone page-cache stand-in) on loopback.
+# Readers fetch catalog/Parquet byte ranges over HTTP; nothing is mounted.
 
-# Install the pinned zerofs binary (no package manager).
-zerofs-setup:
-    python3 scripts/setup_zerofs.py
+# Start MinIO + Cachey (idempotent).
+cachey-up:
+    bash scripts/cachey_up.sh
 
-# Start Garage + Redis + ZeroFS server + FUSE mount (idempotent).
-zerofs-up: zerofs-setup
-    bash scripts/zerofs_up.sh
-
-# Stop the mount and server. Pass --wipe to drop containers and cached state.
-zerofs-down *args:
-    bash scripts/zerofs_down.sh {{args}}
-
-# Create the /lake layout (refs, catalogs, data) on the mount.
-lake-init: zerofs-up
-    #!/usr/bin/env bash
-    set -euo pipefail
-    MNT=/tmp/opencode/lake-mnt
-    mkdir -p "$MNT/refs/tags" "$MNT/catalogs" "$MNT/data/parquet"
-    ls "$MNT"
+# Stop Cachey. Pass --wipe to drop containers and cached state.
+cachey-down *args:
+    bash scripts/cachey_down.sh {{args}}
 
 # Publish a new immutable snapshot, then move a ref at it.
-# This plays the catalog API locally; in prod only the API mutates refs.
+# Build bakes --data-url Cachey paths into the catalog, data syncs to S3,
+# then the catalog + ref move. Catalog versioning (ref service) is TBD;
+# locally scripts/lake_ref.sh plays that role over tiny S3 objects.
 # Example: just lake-publish sha_003 --bbox=13.38,52.50,13.42,52.54 --limit 20000
-lake-publish sha *args: zerofs-up
+lake-publish sha *args: cachey-up
     #!/usr/bin/env bash
     set -euo pipefail
-    MNT=/tmp/opencode/lake-mnt
-    cargo run --locked -- build --out "$MNT/catalogs/{{quote(sha)}}.ducklake" --data-dir "$MNT/data/parquet" {{args}}
-    bash scripts/lake_ref.sh set "{{quote(sha)}}.ducklake" latest
+    source "{{justfile_directory()}}/scripts/dev-s3.env"
+    export RCLONE_CONFIG_LAKE_TYPE=s3 RCLONE_CONFIG_LAKE_PROVIDER=Other
+    export RCLONE_CONFIG_LAKE_ENDPOINT=http://127.0.0.1:3900
+    export RCLONE_CONFIG_LAKE_ACCESS_KEY_ID="$S3_USER"
+    export RCLONE_CONFIG_LAKE_SECRET_ACCESS_KEY="$S3_PASS"
+    export RCLONE_CONFIG_LAKE_REGION="$S3_REGION" RCLONE_CONFIG_LAKE_FORCE_PATH_STYLE=true
+    STAGE=$(mktemp -d /tmp/opencode/publish-XXXXXX)
+    trap 'rm -rf "$STAGE"' EXIT
+    sha={{quote(sha)}}
+    name="$sha.ducklake"
+    CACHEY=http://127.0.0.1:8088
+    cargo run --locked -- build --out "$STAGE/$name" \
+      --data-dir "$STAGE/files" --data-url "$CACHEY/fetch/lake/data/" {{args}}
+    rclone sync "$STAGE/files" lake:lake/data/
+    rclone copyto "$STAGE/$name" "lake:lake/catalogs/$name"
+    bash scripts/lake_ref.sh set "$name" latest
     bash scripts/lake_ref.sh list
 
 # Serve the catalog a ref points at (default: latest), resolved once at
 # startup; the reader stays pinned to that snapshot across later publishes.
-lake-serve ref="latest" *args: zerofs-up
+# Args are positional: just lake-serve <tag> --listen ...
+lake-serve ref="latest" *args: cachey-up
     #!/usr/bin/env bash
     set -euo pipefail
-    MNT=/tmp/opencode/lake-mnt
     catalog=$(bash scripts/lake_ref.sh get {{quote(ref)}})
-    cargo run --locked --release -- serve --shard "$MNT/catalogs/$catalog" {{args}}
+    [ -n "$catalog" ] || { echo "empty ref {{quote(ref)}}" >&2; exit 1; }
+    cargo run --locked --release -- serve --shard "http://127.0.0.1:8088/fetch/lake/catalogs/$catalog" {{args}}
 
 # --- kind whole-stack ------------------------------------------------------
 # 2-AZ kind cluster (nodes carry topology.kubernetes.io/zone; /nvme is the
@@ -115,9 +119,10 @@ lake-serve ref="latest" *args: zerofs-up
 kind-up:
     #!/usr/bin/env bash
     set -euo pipefail
-    kind get clusters | grep -qx lake && exit 0
-    mkdir -p /tmp/opencode/kind-nvme-a /tmp/opencode/kind-nvme-b
-    kind create cluster --config k8s/kind-2az.yaml
+    if ! kind get clusters | grep -qx lake; then
+      mkdir -p /tmp/opencode/kind-nvme-a /tmp/opencode/kind-nvme-b
+      kind create cluster --config k8s/kind-2az.yaml
+    fi
 
 kind-down:
     kind delete cluster --name lake
@@ -127,34 +132,38 @@ kind-image:
     docker build -t iron-feather:kind .
     kind load docker-image iron-feather:kind --name lake
 
-# Install/upgrade the whole stack (zerofs cache layer + read pool).
+# Install/upgrade the whole stack (cachey cache layer + read pool).
 # image.tag=kind matches `just kind-image`; writer stays off unless asked.
 kind-install *args:
     helm dependency update charts/iron-feather >/dev/null
     helm upgrade --install lake charts/iron-feather --namespace lake --create-namespace --set image.tag=kind {{args}}
 
-# One-time S3 bootstrap: Garage layout + bucket + key -> lake-s3 Secret.
-# Run after kind-install (gateways wait on the Secret, then start).
-kind-bootstrap-s3:
-    NS=lake bash scripts/kind_bootstrap_s3.sh
+# The dev lake-s3 Secret ships in the cachey chart (backend.enabled);
+# no bootstrap step exists. In prod, supply it out of band.
 
 # Deterministic Berlin workload (seed 7; regenerates byte-identical).
 workloads-berlin dir="workloads/berlin":
     python3 scripts/make_berlin_workload.py --out-dir {{quote(dir)}}
 
-# Berlin benchmark against a port-forwarded read pool (cacheMb=0 for
-# storage numbers; default 256 measures the app response cache instead).
+# Berlin benchmark against a port-forwarded read pool. Responses always
+# execute against the pool; repeated storage reads hit zone-shared Cachey.
 kind-bench base="http://127.0.0.1:3000" workload="workloads/berlin/mixed.txt": workloads-berlin
     cargo run --locked --release --example http_bench -- --base {{quote(base)}} --concurrency 8 --passes 1 --warmup-secs 0 --workload {{quote(workload)}}
 
 kind-status:
-    kubectl -n lake get pods,statefulsets,pvc,storageclasses 2>&1 | head -30
+    kubectl -n lake get pods,deployments,services 2>&1 | head -30
 
-# Seed the lake volume with the Berlin snapshot (same shape as the writer).
+# Seed the lake with the Berlin snapshot (same shape as the writer).
 kind-seed:
     kubectl apply -f k8s/seed-job.yaml
     kubectl -n lake wait --for=condition=complete --timeout=1200s job/lake-seed-berlin
     kubectl -n lake logs job/lake-seed-berlin | tail -2
+
+# Real-stack test: MinIO → Cachey → servers over real HTTP range reads.
+# Needs docker, rclone, curl, python3 and the prebuilt DuckDB in .deps
+# (`just setup-duckdb` runs first).
+test-stack: setup-duckdb
+    bash tests/stack/cachey_stack.sh
 
 # Smoke-check a running lake server (default: local :3000).
 lake-verify base="http://127.0.0.1:3000":
@@ -169,8 +178,8 @@ run shard="fixtures/osm.ducklake" *args: setup-duckdb
     cargo run --locked --release -- serve --shard {{quote(shard)}} {{args}}
 
 # Full workload battery against a running release server (see `just workloads`).
-# Small files (broad/deep/empty) fit the cache after warmup: serve with
-# --cache-mb 0 to measure first-render and traversal cost instead.
+# Small files (broad/deep/empty) fit in Cachey after warmup: wipe the Cachey
+# disk to measure first-render and traversal cost instead.
 bench-workloads dir="workloads/nw-europe" *args:
     #!/usr/bin/env bash
     set -euo pipefail

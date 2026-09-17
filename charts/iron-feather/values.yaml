@@ -1,16 +1,21 @@
-# Read pool over the ZeroFS lake. Installs into the same namespace as the
-# zerofs dependency so short gateway DNS names resolve for the node plugin.
+# Read pool over the Cachey-cached lake. Readers are plain HTTP clients of
+# their zone's Cachey: no volumes, no CSI, no mounts.
 image:
   repository: iron-feather
   tag: latest
   pullPolicy: IfNotPresent
 
-# Pinned snapshot ref resolved once per pod at startup (latest, main, or a
-# tag). Restart pods (rollout) to move readers to a newer snapshot.
-ref: latest
+# S3 bucket holding catalogs/, data/ and refs/. Only Cachey and the
+# writer talk to S3; readers only ever fetch ranged HTTP from Cachey.
+s3bucket: lake
 
-# Spread readers across zones; each mounts the lake read-only.
-replicas: 2
+# Concrete published catalog readers pin to (restart/rollout to move).
+# Written by the seed job or the writer; see refs/ in S3 for history.
+catalog: sha_berlin.ducklake
+
+# One Deployment per zone; each pod fetches through its zone's Cachey
+# Service, so the page cache is shared zone-wide.
+replicasPerZone: 1
 zones:
   - az-a
   - az-b
@@ -22,27 +27,26 @@ resources: {}
 service:
   port: 3000
 
-# In-app HTTP response cache in MiB. 0 forces every request down to
-# DuckDB/ZeroFS (storage benchmark mode); 256 is the serving default.
-cacheMb: 256
+# S3 endpoint + Secret for the writer/seed upload sidecars. Defaults address
+# the bundled MinIO; point at real S3 when cachey.enabled=false.
+# cacheyUrlBase overrides the per-zone Cachey base readers and the writer use
+# (default: this release's zone Services).
+s3endpoint: ""
+s3secret: ""
+cacheyUrlBase: ""
 
-# Shared lake volume (one directory on the ZeroFS filesystem, ReadWriteMany).
-# storageClass must be a zerofs per-zone class; the name defaults to this
-# release's az-a class.
-persistence:
-  size: 1Gi
-  # storageClass: lake-lake-az-a
-
-# Optional single writer: hourly build + ref move (the ETL publisher).
-# The only component allowed to mutate refs.
+# Optional single writer: hourly build + S3 upload + ref move (the ETL
+# publisher). The only component allowed to mutate refs. Needs the S3
+# Secret (same one Cachey uses) for the upload sidecar.
 writer:
   enabled: false
   schedule: "0 * * * *"
   bbox: 13.35,52.48,13.45,52.55
   limit: 20000
   collection: buildings
+  dataPrefix: data
 
-# Subchart (Garage/Redis/gateways/CSI). Disable when pointing at an
-# existing ZeroFS estate (then set persistence.storageClass explicitly).
-zerofs:
+# Subchart (MinIO + per-zone Cachey). Disable when pointing at an
+# existing estate (then set cacheyUrl overrides explicitly).
+cachey:
   enabled: true

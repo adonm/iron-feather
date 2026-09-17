@@ -6,8 +6,8 @@
 OSM Layercake GeoParquet (HTTPS)
   → bbox-pruned import → DuckLake catalog + clustered Parquet (local or S3)
                           └─ shared read-only connection pool
-                               ├─ OGC Features / XYZ tiles → cached response bytes
-                               └─ Arrow Flight → native DuckDB Arrow batches (uncached)
+                               ├─ OGC Features / XYZ tiles → response bytes
+                               └─ Arrow Flight → native DuckDB Arrow batches
                           └─ Quack bulk listener → pinned read-only snapshot
 ```
 
@@ -98,9 +98,11 @@ different shard extent.
 `serve --shard` takes a local `.ducklake` catalog path or the HTTP(S)/`s3://`
 URL of a published catalog and attaches it read-only. For private S3,
 prefer a short-lived presigned HTTPS object URL; the binary deliberately does
-not accept cloud credentials. Every pooled connection is switched to the
-attached catalog; DuckLake resolves its Parquet data files at query time, so
-all SQL remains server-generated.
+not accept cloud credentials. In production the catalog's Parquet paths point
+at the per-zone Cachey `/fetch/` prefix, so all storage reads are range GETs
+through the shared page cache (see [`docs/cachey-lake.md`](docs/cachey-lake.md)).
+Every pooled connection is switched to the attached catalog; DuckLake resolves
+its Parquet data files at query time, so all SQL remains server-generated.
 
 Spatial queries prune by file/row-group bbox statistics, then run exact
 `ST_Intersects` only on boundary candidates (fully contained bboxes skip it).
@@ -140,8 +142,8 @@ Unsupported parameters, including `filter` and `properties`, return 400.
 Supply `?sources=1,2` or `X-Source-Ids: 1,2`; Flight accepts `sources` in its
 ticket or `x-source-ids` metadata. If both are supplied, their **intersection**
 is used. Missing both, or an explicitly empty set, returns no features.
-These are data filters, not authentication. Cached results include the full
-effective source set, and a cache belongs to one immutable shard instance.
+These are data filters, not authentication. Responses include the full
+effective source set.
 
 ## Arrow Flight
 
@@ -213,8 +215,9 @@ lane. `--threads` sets shared DuckDB threads for the whole process
 fewer connections for bulk) and `--memory-mb` caps shared DuckDB memory in
 MiB (default 4096, sized for the ~10 GB shard urban working set; 0 leaves
 DuckDB's unbounded default). Parquet/HTTP block and metadata caching lives
-in ZeroFS below the mount, not in DuckDB: there are no storage-tuning flags
-by design (see [`docs/zerofs-lake.md`](docs/zerofs-lake.md)).
+in Cachey, the per-zone page cache readers fetch through, not in DuckDB:
+there are no storage-tuning flags by design (see
+[`docs/cachey-lake.md`](docs/cachey-lake.md)).
 `--query-timeout-ms` interrupts HTTP and Flight
 queries past their deadline (default 30000; 0 disables). Queries run on blocking
 workers with one bounded lifecycle: cancellation is owned from before
@@ -224,23 +227,20 @@ query), oversized batches drain instead of spinning, and fetch failures
 surface as errors instead of truncated streams. Batches flow through a
 per-stream byte budget (`--flight-stream-mb`, default 32) plus a process-wide
 budget (`--flight-total-mb`, default 128). Narrow scans fetch page payloads
-late via file/row-number instead of reading geom+properties first. Moka coalesces identical HTTP requests and caches HTTP
-bytes, with a `--cache-mb` budget (default 256 MiB). Set `--cache-mb 0` to
-measure the uncached path. `/metrics` is `no-store` and reports
-`cache_requests` (lookups), `http_requests`, `cache_hits` (fast-path),
-`cache_coalesced` (shared waiters), `cache_computes`, `cache_failures`,
-`cache_evictions`, plus `duck_setting_*` engine budgets (threads, memory).
-Storage-cache benchmarks now live behind the mount instead: see
-[`docs/zerofs-lake.md`](docs/zerofs-lake.md) for the local rig
-(`just zerofs-up`, `just lake-publish`, `just lake-serve`).
+late via file/row-number instead of reading geom+properties first. `/metrics`
+is `no-store` and reports `http_requests` plus `duck_setting_*` engine
+budgets (threads, memory). Storage-cache benchmarks now live in Cachey
+instead: see [`docs/cachey-lake.md`](docs/cachey-lake.md) for the local rig
+(`just cachey-up`, `just lake-publish`, `just lake-serve`).
 Error responses are always `Cache-Control: no-store` and carry no ETag.
 
 GeoJSON embeds DuckDB's geometry/properties text without a Rust-side
-re-parse, equivalent page URLs share one cache entry, and every response
-carries an `ETag` with `Cache-Control: public, max-age=60` (`If-None-Match`
-returns 304). ETags are computed once per cached body, and gzip variants are
-compressed once then served from the same byte budget with their own strong
-ETag; MVT tiles are already compact and skip compression.
+re-parse, and every response carries an `ETag` with
+`Cache-Control: public, max-age=60` (`If-None-Match` returns 304). ETags
+are content hashes over the exact bytes, and gzip variants are compressed
+per request with their own strong ETag; MVT tiles are already compact and
+skip compression. Repeated storage reads are absorbed by the zone-shared
+Cachey layer, not by per-pod memory.
 
 Use a release server. The compiled HTTP client warms up before its timed
 phase, counts successful responses separately from overload/errors, consumes
@@ -264,7 +264,7 @@ just bench-workloads dir=workloads/nw-europe
 Use a fresh `--seed` per jitter run: every request in a run is unique and
 warmup never overlaps measurement. Keep seeds small (1-3 on the Berlin
 fixture): larger seeds drift the bbox out of the data and measure empty
-pages instead. Pass `--cache-mb 0` for true miss tests. Defaults match the
+pages instead. Defaults match the
 Berlin fixture; pass `--bbox` for another shard. These are closed-loop
 client measurements; compare successful rps, p50/p99, rejected (429) counts
 and wire throughput together. To size capacity, sweep `--connections
@@ -279,18 +279,21 @@ discarded rows than `OFFSET` (verified 3.5x on full-region pages at offset
 ### Replicas
 
 Snapshots are immutable, so scale past one CPU by running one instance per
-core group against the same catalog. Each replica keeps its own pool and
-in-app response cache: budget roughly one `--connections` pool (8 DuckDB
-threads at one thread each) plus `--cache-mb` per instance, and confirm with
-`bench-http` round-robining across replicas versus one instance:
+core group against the same catalog. Each replica keeps its own pool:
+budget roughly one `--connections` pool (8 DuckDB threads at one thread
+each) per instance, with repeated storage reads shared zone-wide through
+Cachey, and confirm with `bench-http` round-robining across replicas
+versus one instance:
 
 ```sh
 BASE=http://127.0.0.1:3010,http://127.0.0.1:3012 CONC=8 DUR=15 just bench-http -- --jitter --seed 2
 ```
 
-On the 20k Berlin fixture, loopback, two 4-connection/128 MiB replicas
-served jittered misses at ~720 rps against ~350 rps for one 8-connection
-instance at equal totals.
+On the 20k Berlin fixture, loopback, two 4-connection replicas served
+jittered misses at ~720 rps against ~350 rps for one 8-connection instance
+at equal totals (measured before the app-cache removal; the scaling shape
+— replicas add DuckDB throughput, Cachey shares storage reads — still
+applies).
 
 Reference loopback run on the 5.17 GB / 14.985M-feature single-file Layercake
 shard (DuckDB 1.5.5 era, before the DuckLake-only rewrite; kept for scale
@@ -309,14 +312,14 @@ is the current reference; re-run it on the 2.0 nightly before quoting
 ratios externally.
 
 Verified on the nightly (`v2.0.0-alpha42069`, 20k Berlin lake, loopback
-`rclone serve s3`, `--cache-mb 0`): local and S3 return identical items and
-MVT bytes; miss-path HTTP runs 56 vs 54 rps and 1,000-row Flight runs
-40 vs 41 rps.
+`rclone serve s3`): local and S3 return identical items and MVT bytes;
+miss-path HTTP runs 56 vs 54 rps and 1,000-row Flight runs 40 vs 41 rps
+(measured before the app-cache removal, on unique-URL miss traffic).
 
 These are not universal capacity claims; run the included tools on the target
 CPU, storage, shard size and response shape.
 
 `just check test` runs Clippy and real-DuckDB regressions for materialization,
 geometry/lineage agreement between protocols, pagination, request validation,
-Flight discovery and empty schemas, tile cache isolation and Mercator encoding,
-read-only operation, overload and cancellation.
+Flight discovery and empty schemas, tile coordinate isolation and Mercator
+encoding, read-only operation, overload and cancellation.

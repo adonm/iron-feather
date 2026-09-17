@@ -47,9 +47,6 @@ enum Command {
         /// reserve connections for interactive OGC.
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..))]
         flight_concurrency: u16,
-        /// Response-cache budget for HTTP bytes. Flight runs uncached.
-        #[arg(long, default_value_t = 256)]
-        cache_mb: u32,
         /// Shared DuckDB threads for the whole process. Keep at 1 for many
         /// small concurrent queries; raise only with fewer connections for
         /// bulk.
@@ -105,7 +102,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_wait_ms,
             max_waiters,
             flight_concurrency,
-            cache_mb,
             threads,
             memory_mb,
             query_timeout_ms,
@@ -124,7 +120,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = store::StoreConfig {
                 location: shard.clone(),
                 connections: connections.into(),
-                cache_bytes: u64::from(cache_mb) * 1024 * 1024,
                 max_waiters: max_waiters.into(),
                 max_wait: std::time::Duration::from_millis(max_wait_ms),
                 bulk_limit,

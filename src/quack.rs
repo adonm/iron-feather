@@ -31,7 +31,7 @@
 
 use crate::{
     db::{self, NeoConnection, NeoDatabase},
-    store::{Error, StoreConfig},
+    store::{cachey_secret_sql, Error, StoreConfig},
 };
 use duckdb_neo::Parameters;
 use std::net::SocketAddr;
@@ -168,6 +168,11 @@ fn setup_quack_session(
             "SET autoload_known_extensions=false",
         ],
     )?;
+    // Same Cachey request-config header as the serving pool: the guard
+    // installed below rejects secret creation, so this runs before it.
+    if let Some(secret) = cachey_secret_sql(catalog) {
+        db::execute_all(conn, &[secret.as_str()])?;
+    }
     let _ = (cfg, remote);
     db::execute_all(
         conn,

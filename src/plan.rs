@@ -73,10 +73,6 @@ impl ItemsRequest {
         parts.join("&")
     }
 
-    pub fn cache_key(&self) -> String {
-        format!("items:{}:{}", self.collection, self.canonical_qs())
-    }
-
     pub fn href(&self) -> String {
         format!(
             "/collections/{}/items?{}",
@@ -139,14 +135,4 @@ pub fn page_parts(base: &str, limit: u32, pagination: &Pagination) -> (String, S
             format!("ORDER BY id LIMIT {} OFFSET {}", limit + 1, offset),
         ),
     }
-}
-
-/// Tile cache key: coordinate plus effective source set.
-pub fn tile_key(z: u8, x: u32, y: u32, collection: &str, sources: &[i64]) -> String {
-    format!("tile:{z}:{x}:{y}:{collection}:{sources:?}")
-}
-
-/// Single-feature cache key.
-pub fn item_key(collection: &str, id: &str, sources: &[i64]) -> String {
-    format!("item:{collection}:{id}:{sources:?}")
 }

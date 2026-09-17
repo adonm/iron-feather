@@ -1,5 +1,6 @@
-//! One immutable snapshot, one bounded-queue pool, one byte-bounded response cache.
-//! Moka owns caching and cancellation-safe request coalescing for HTTP.
+//! One immutable snapshot and one bounded-queue pool. Responses are
+//! computed per request; repeated storage reads are absorbed by the
+//! zone-shared Cachey layer below.
 //!
 //! All DuckDB access goes through the stable v2 C API, see [`crate::db`].
 
@@ -13,11 +14,10 @@ use arrow::{
 };
 use bytes::Bytes;
 use duckdb_neo::Parameters;
-use moka::future::Cache;
 use std::{
     io::Write,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -70,7 +70,6 @@ pub struct LakeLayout {
 pub struct StoreConfig {
     pub location: String,
     pub connections: usize,
-    pub cache_bytes: u64,
     pub max_waiters: usize,
     pub max_wait: Duration,
     pub bulk_limit: usize,
@@ -91,7 +90,6 @@ impl Default for StoreConfig {
         Self {
             location: String::new(),
             connections: 8,
-            cache_bytes: 256 * 1024 * 1024,
             max_waiters: 128,
             max_wait: Duration::from_millis(250),
             bulk_limit: 8,
@@ -290,37 +288,6 @@ pub enum WorkClass {
     Bulk,
 }
 
-/// Counters for the HTTP response cache. `requests` counts cache lookups
-/// (one HTTP request can cause up to two: gzip then identity). `http_requests`
-/// counts HTTP responses attempted. `hits` counts fast-path hits,
-/// `coalesced` counts waiters that shared another caller's computation,
-/// `computes` counts distinct miss executions, `failures` counts miss
-/// executions that returned an error. Hit rate over lookups is
-/// `(hits + coalesced) / requests`.
-#[derive(Debug, Default)]
-pub struct CacheStats {
-    pub requests: AtomicU64,
-    pub http_requests: AtomicU64,
-    pub hits: AtomicU64,
-    pub coalesced: AtomicU64,
-    pub computes: AtomicU64,
-    pub failures: AtomicU64,
-    pub evictions: AtomicU64,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct CacheSnapshot {
-    pub entries: u64,
-    pub weight_bytes: u64,
-    pub requests: u64,
-    pub http_requests: u64,
-    pub hits: u64,
-    pub coalesced: u64,
-    pub computes: u64,
-    pub failures: u64,
-    pub evictions: u64,
-}
-
 pub struct Store {
     pub collections: Vec<String>,
     /// Pinned DuckLake snapshot this instance serves. Resolved at startup;
@@ -340,12 +307,11 @@ pub struct Store {
     flight_used: Arc<AtomicUsize>,
     #[allow(dead_code)]
     manifest: Option<ShardManifest>,
-    http: Cache<String, CachedBody>,
-    stats: Arc<CacheStats>,
+    http_requests: AtomicUsize,
 }
 
-/// A cached HTTP representation with its validator, computed once on miss.
-/// Cloning is cheap: the body is reference-counted and the tag is small.
+/// An HTTP representation with its validator. Cloning is cheap: the body
+/// is reference-counted and the tag is small.
 #[derive(Debug, Clone)]
 pub struct CachedBody {
     pub bytes: Bytes,
@@ -411,18 +377,51 @@ pub fn catalog_url(location: &str) -> String {
     format!("ducklake:{}", location.trim_end_matches('/'))
 }
 
+/// Origin (scheme + authority) of an http(s) location, with an optional
+/// `ducklake:` catalog prefix stripped. Used to scope the Cachey
+/// request-config secret below.
+fn http_origin(location: &str) -> Option<String> {
+    let location = location.strip_prefix("ducklake:").unwrap_or(location);
+    for scheme in ["http://", "https://"] {
+        if let Some(rest) = location.strip_prefix(scheme) {
+            let authority = rest.split('/').next().unwrap_or("");
+            if !authority.is_empty() {
+                return Some(format!("{scheme}{authority}"));
+            }
+        }
+    }
+    None
+}
+
+/// `CREATE OR REPLACE SECRET` attaching `C0-Config: fps=true` to requests
+/// under the catalog's origin, so Cachey fetches path-style from any
+/// S3-compatible backend. `None` for local catalogs (no HTTP involved).
+/// Data files live under the same Cachey base in every layout we publish,
+/// so the catalog origin covers them.
+pub(crate) fn cachey_secret_sql(location: &str) -> Option<String> {
+    http_origin(location).map(|origin| {
+        format!(
+            "CREATE OR REPLACE SECRET iron_feather_cachey (TYPE http, SCOPE {}, EXTRA_HTTP_HEADERS MAP {{'C0-Config': 'fps=true'}})",
+            crate::filter::quote(&origin)
+        )
+    })
+}
+
 /// Full per-connection setup: extensions, then the catalog attach pinned to
 /// `snapshot`. Every pooled connection runs the session part; the ATTACH
 /// itself is database-level and done once (see [`Store::open_config`]).
-/// Storage caching (Parquet/HTTP block and metadata caches) lives in the
-/// ZeroFS layer below the mount, not in DuckDB: no cache tuning here.
-fn setup_session(conn: &NeoConnection, _cfg: &StoreConfig, _remote: bool) -> Result<(), Error> {
+/// Parquet/HTTP block and metadata caching lives in the Cachey layer the
+/// catalog URLs point at, not in DuckDB: no cache tuning here.
+fn setup_session(conn: &NeoConnection, cfg: &StoreConfig, _remote: bool) -> Result<(), Error> {
     // Every extension installs on demand (fresh containers have an empty
     // extension dir), then the lockdown below freezes further installs.
     for ext in ["ducklake", "spatial", "httpfs"] {
         if db::execute_all(conn, &[&format!("LOAD {ext}")]).is_err() {
             db::execute_all(conn, &[&format!("INSTALL {ext}"), &format!("LOAD {ext}")])?;
         }
+    }
+    if let Some(secret) = cachey_secret_sql(&cfg.location) {
+        db::execute_all(conn, &[secret.as_str()])?;
     }
     db::execute_all(
         conn,
@@ -439,7 +438,6 @@ impl Store {
     pub fn open(
         location: &str,
         connections: usize,
-        cache_bytes: u64,
         max_waiters: usize,
         max_wait: Duration,
         bulk_limit: usize,
@@ -450,7 +448,6 @@ impl Store {
         Self::open_config(StoreConfig {
             location: location.to_string(),
             connections,
-            cache_bytes,
             max_waiters,
             max_wait,
             bulk_limit,
@@ -477,8 +474,6 @@ impl Store {
         // shares the queue like everything else.
         let bulk = (cfg.bulk_limit < cfg.connections)
             .then(|| Arc::new(tokio::sync::Semaphore::new(cfg.bulk_limit)));
-        let stats = Arc::new(CacheStats::default());
-        let evictions = stats.clone();
         let remote = ["http://", "https://", "s3://"]
             .iter()
             .any(|scheme| cfg.location.starts_with(scheme));
@@ -570,36 +565,18 @@ impl Store {
             flight_total_budget: cfg.flight_total_bytes,
             flight_used: Arc::new(AtomicUsize::new(0)),
             manifest,
-            http: Cache::builder()
-                .max_capacity(cfg.cache_bytes)
-                .weigher(|key: &String, value: &CachedBody| {
-                    (key.len() + value.bytes.len() + value.etag.len()).min(u32::MAX as usize) as u32
-                })
-                .eviction_listener(move |_, _, _| {
-                    evictions.evictions.fetch_add(1, Ordering::Relaxed);
-                })
-                .build(),
-            stats,
+            http_requests: AtomicUsize::new(0),
         })
     }
 
-    /// Point-in-time cache counters for capacity experiments.
-    pub fn cache_stats(&self) -> CacheSnapshot {
-        CacheSnapshot {
-            entries: self.http.entry_count(),
-            weight_bytes: self.http.weighted_size(),
-            requests: self.stats.requests.load(Ordering::Relaxed),
-            http_requests: self.stats.http_requests.load(Ordering::Relaxed),
-            hits: self.stats.hits.load(Ordering::Relaxed),
-            coalesced: self.stats.coalesced.load(Ordering::Relaxed),
-            computes: self.stats.computes.load(Ordering::Relaxed),
-            failures: self.stats.failures.load(Ordering::Relaxed),
-            evictions: self.stats.evictions.load(Ordering::Relaxed),
-        }
+    /// HTTP responses served. Storage reads are not counted here; Cachey
+    /// reports its own page/download counters.
+    pub fn http_requests(&self) -> usize {
+        self.http_requests.load(Ordering::Relaxed)
     }
 
     /// Storage-cache tuning actually in effect. All block/metadata caching
-    /// lives in the ZeroFS layer below the mount; DuckDB only reports its
+    /// lives in the Cachey layer the catalog URLs point at; DuckDB only reports its
     /// engine budgets here so bench logs stay comparable.
     pub async fn duck_tuning(&self) -> Vec<(String, String)> {
         self.run(|conn| {
@@ -744,68 +721,17 @@ impl Store {
         result
     }
 
-    /// One HTTP response attempt (used for http_requests, distinct from
-    /// per-representation cache lookups).
+    /// One HTTP response served.
     pub fn note_http(&self) {
-        self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
+        self.http_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A cached entry without computing anything. Lets callers check one
-    /// representation (for example gzip) before paying for another.
-    /// Counts as a lookup, and as a fast-path hit when present.
-    pub async fn get(&self, key: &str) -> Option<CachedBody> {
-        self.stats.requests.fetch_add(1, Ordering::Relaxed);
-        let hit = self.http.get(key).await;
-        if hit.is_some() {
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
-        }
-        hit
-    }
-
-    async fn cached_compute<F, Fut>(&self, key: String, compute: F) -> Result<CachedBody, Error>
-    where
-        F: FnOnce() -> Fut + Send,
-        Fut: std::future::Future<Output = Result<Bytes, Error>> + Send,
-    {
-        self.stats.requests.fetch_add(1, Ordering::Relaxed);
-        if let Some(hit) = self.http.get(&key).await {
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(hit);
-        }
-        let stats = self.stats.clone();
-        let computed = Arc::new(AtomicU64::new(0));
-        let computed_flag = computed.clone();
-        let result = self
-            .http
-            .try_get_with(key, async move {
-                stats.computes.fetch_add(1, Ordering::Relaxed);
-                computed_flag.store(1, Ordering::Relaxed);
-                match compute().await {
-                    Ok(bytes) => Ok(CachedBody::with_bytes(bytes)),
-                    Err(e) => {
-                        stats.failures.fetch_add(1, Ordering::Relaxed);
-                        Err(e)
-                    }
-                }
-            })
-            .await
-            .map_err(|e: Arc<Error>| (*e).clone());
-        let result = result?;
-        if computed.load(Ordering::Relaxed) == 0 {
-            // Another caller computed while we waited, or the entry landed
-            // between the fast-path check and `try_get_with`.
-            self.stats.coalesced.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(result)
-    }
-
-    /// Key must include every input used to produce the encoded HTTP body.
-    /// The validator is computed once on miss and travels with the bytes, so
-    /// hits and revalidations never rehash the body. Fast-path hits and
-    /// coalesced waiters are counted separately; only the single computing
-    /// caller counts as a compute. Failures are counted and never cached.
-    /// Heavy pages share the bulk lane with Flight.
-    pub async fn bytes<F>(&self, key: String, heavy: bool, query: F) -> Result<CachedBody, Error>
+    /// Run one HTTP response query on the pool and wrap the bytes with a
+    /// validator. Every request executes: identical concurrent requests each
+    /// run their own query (bounded by pool admission), and the zone-shared
+    /// Cachey layer absorbs repeated storage reads. Heavy pages share the
+    /// bulk lane with Flight.
+    pub async fn run_bytes<F>(&self, heavy: bool, query: F) -> Result<CachedBody, Error>
     where
         F: FnOnce(&NeoConnection) -> Result<Bytes, Error> + Send + 'static,
     {
@@ -814,32 +740,8 @@ impl Store {
         } else {
             WorkClass::Interactive
         };
-        self.cached_compute(
-            key,
-            move || async move { self.run_class(class, query).await },
-        )
-        .await
-    }
-
-    /// Backwards-compatible interactive-only entry used by existing callers.
-    #[allow(dead_code)]
-    pub async fn bytes_interactive<F>(&self, key: String, query: F) -> Result<CachedBody, Error>
-    where
-        F: FnOnce(&NeoConnection) -> Result<Bytes, Error> + Send + 'static,
-    {
-        self.bytes(key, false, query).await
-    }
-
-    /// A stored gzip variant of an already-cached body, sharing the same
-    /// byte budget. Pure CPU work: no pool connection is consumed, and
-    /// concurrent misses for one body compress it once.
-    pub async fn compressed(&self, key: String, raw: Bytes) -> Result<CachedBody, Error> {
-        self.cached_compute(key, move || async move {
-            tokio::task::spawn_blocking(move || gzip_bytes(&raw))
-                .await
-                .map_err(|e| Error::Backend(e.to_string()))?
-        })
-        .await
+        let bytes = self.run_class(class, query).await?;
+        Ok(CachedBody::with_bytes(bytes))
     }
 
     /// Single predicate-preserving Arrow query (see [`Store::predicate`]);
@@ -1052,4 +954,41 @@ fn gzip_bytes(raw: &[u8]) -> Result<Bytes, Error> {
         .finish()
         .map(Bytes::from)
         .map_err(|e| Error::Backend(e.to_string()))
+}
+
+/// Compress one response body off the async runtime. No pooling, no
+/// caching: every gzip request pays CPU once.
+pub(crate) async fn gzip_body(raw: Bytes) -> Result<CachedBody, Error> {
+    tokio::task::spawn_blocking(move || gzip_bytes(&raw).map(CachedBody::with_bytes))
+        .await
+        .map_err(|e| Error::Backend(e.to_string()))?
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::{cachey_secret_sql, http_origin};
+
+    #[test]
+    fn origin_scopes_to_scheme_and_authority() {
+        assert_eq!(
+            http_origin("http://127.0.0.1:8088/fetch/lake/c/x.ducklake"),
+            Some("http://127.0.0.1:8088".into())
+        );
+        assert_eq!(
+            http_origin("ducklake:https://cachey-az-a/fetch/lake/c/x.ducklake"),
+            Some("https://cachey-az-a".into())
+        );
+        assert_eq!(http_origin("s3://lake/c/x.ducklake"), None);
+        assert_eq!(http_origin("/mnt/lake/c/x.ducklake"), None);
+        assert_eq!(http_origin("http:///no-authority"), None);
+    }
+
+    #[test]
+    fn secret_attaches_path_style_header_to_the_origin() {
+        let sql = cachey_secret_sql("http://lake-cachey-az-a/fetch/lake/c/x.ducklake").unwrap();
+        assert!(sql.starts_with("CREATE OR REPLACE SECRET iron_feather_cachey"));
+        assert!(sql.contains("SCOPE 'http://lake-cachey-az-a'"));
+        assert!(sql.contains("'C0-Config': 'fps=true'"));
+        assert_eq!(cachey_secret_sql("fixtures/osm.ducklake"), None);
+    }
 }

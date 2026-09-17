@@ -1,5 +1,6 @@
-# One-shot seeder: builds the Berlin snapshot straight into the lake PVC.
-# Mirrors what the optional writer CronJob does on its hourly cadence.
+# One-shot seeder: builds the Berlin snapshot, uploads data + catalog to S3,
+# and moves refs/latest at it. Mirrors what the optional writer CronJob does
+# on its hourly cadence. Readers fetch everything through their zone's Cachey.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -18,7 +19,7 @@ spec:
                   - key: topology.kubernetes.io/zone
                     operator: In
                     values: ["az-a"]
-      containers:
+      initContainers:
         - name: build
           image: iron-feather:kind
           imagePullPolicy: IfNotPresent
@@ -27,19 +28,53 @@ spec:
             - -c
             - |
               set -eu
-              mkdir -p /lake/refs/tags /lake/catalogs /lake/data/parquet
-              if [ ! -f /lake/catalogs/sha_berlin.ducklake ]; then
-                iron-feather build --bbox=13.35,52.48,13.45,52.55 --limit 20000 \
-                  --out /lake/catalogs/sha_berlin.ducklake \
-                  --data-dir /lake/data/parquet
-              fi
-              printf '%s' sha_berlin.ducklake > /lake/refs/latest
-              printf '%s' sha_berlin.ducklake > /lake/refs/main
-              echo seeded
+              iron-feather build --bbox=13.35,52.48,13.45,52.55 --limit 20000 \
+                --out /stage/sha_berlin.ducklake \
+                --data-dir /stage/files \
+                --data-url 'http://lake-cachey-az-a/fetch/lake/data/'
+              printf '%s' sha_berlin.ducklake > /stage/catalog-name
           volumeMounts:
-            - name: lake
-              mountPath: /lake
+            - name: stage
+              mountPath: /stage
+      containers:
+        - name: publish
+          image: rclone/rclone@sha256:45401ad7410db1d67ffdb58e19059ad20b0d8e0285a60e38bbec55cc1019c7a5
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              name=$(cat /stage/catalog-name)
+              rclone sync /stage/files lake:lake/data/
+              rclone copyto "/stage/$name" "lake:lake/catalogs/$name"
+              rclone rcat lake:lake/refs/latest < /stage/catalog-name
+              rclone rcat lake:lake/refs/main < /stage/catalog-name
+              echo seeded
+          env:
+            - name: RCLONE_CONFIG_LAKE_TYPE
+              value: s3
+            - name: RCLONE_CONFIG_LAKE_PROVIDER
+              value: Other
+            - name: RCLONE_CONFIG_LAKE_ENDPOINT
+              value: http://lake-minio:9000
+            - name: RCLONE_CONFIG_LAKE_REGION
+              value: us-east-1
+            - name: RCLONE_CONFIG_LAKE_FORCE_PATH_STYLE
+              value: "true"
+            - name: RCLONE_CONFIG_LAKE_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: lake-s3
+                  key: AWS_ACCESS_KEY_ID
+            - name: RCLONE_CONFIG_LAKE_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: lake-s3
+                  key: AWS_SECRET_ACCESS_KEY
+          volumeMounts:
+            - name: stage
+              mountPath: /stage
       volumes:
-        - name: lake
-          persistentVolumeClaim:
-            claimName: lake-lake
+        - name: stage
+          emptyDir: {}

@@ -10,7 +10,7 @@ sizes (`--connections 4/8/16/32`). Compare successful rps, p50/p99 and the
 target such as p99 < 100 ms and < 1% rejected requests.
 
 Cache-miss tests: pass a fresh --seed per run (jitter URLs otherwise repeat
-across runs and hit the response cache) or serve with --cache-mb 0.
+across runs and hit Cachey-warmed pages instead of S3).
 """
 import argparse
 from collections import Counter

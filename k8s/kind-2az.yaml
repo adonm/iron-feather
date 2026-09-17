@@ -1,5 +1,6 @@
 # 2-AZ kind simulation: workers carry real topology zone labels and a
-# node-local /nvme extraMount (the NVMe stand-in for ZeroFS gateway caches).
+# node-local /nvme extraMount (the NVMe stand-in for Cachey disk caches and
+# the Garage backend).
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: lake

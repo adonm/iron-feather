@@ -1,6 +1,6 @@
 dependencies:
-- name: zerofs
-  repository: file://../zerofs
+- name: cachey
+  repository: file://../cachey
   version: 0.1.0
-digest: sha256:216b1b749ab8dffcd1c60af8f0dde50f6f8a2872d6e9453f4aed439b1bf69c01
-generated: "2026-09-17T07:29:19.37333301+08:00"
+digest: sha256:437f0795454a59c517f57549d462d2092f2b54f313b6a15165fe0b3a822e15be
+generated: "2026-09-17T08:12:21.365984806+08:00"

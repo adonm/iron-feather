@@ -1,0 +1,82 @@
+# One Cachey Deployment + Service per zone. Readers in a zone fetch through
+# their zone's Service, so the page cache is shared zone-wide. Cache disk is
+# node-local (hostPath NVMe); the Deployment pins to its zone so the disk
+# follows the cache identity across restarts.
+{{- range $zone := .Values.zones }}
+{{- $name := include "cachey.zoneName" (list $ $zone) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+spec:
+  selector:
+    app: {{ $name }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/zone
+                    operator: In
+                    values: ["{{ $zone }}"]
+      containers:
+        - name: cachey
+          image: {{ $.Values.images.cachey }}
+          args:
+            - --memory
+            - {{ $.Values.cache.memory }}
+            - --disk-path
+            - /cache
+            - --disk-capacity
+            - {{ $.Values.cache.diskCapacity }}
+            - --max-download-memory
+            - {{ $.Values.cache.maxDownloadMemory }}
+            - --port
+            - "80"
+          ports:
+            - name: http
+              containerPort: 80
+          env:
+            - name: AWS_REGION
+              value: {{ $.Values.s3.region | quote }}
+            - name: AWS_ENDPOINT_URL_S3
+              value: {{ $.Values.s3.endpointUrl | quote }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.s3.existingSecret }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.s3.existingSecret }}
+                  key: AWS_SECRET_ACCESS_KEY
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: cache
+          hostPath:
+            path: {{ $.Values.cache.dir }}-{{ $zone }}
+            type: DirectoryOrCreate
+{{- end }}

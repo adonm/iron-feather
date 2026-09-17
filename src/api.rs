@@ -4,7 +4,7 @@ use crate::{
     db::NeoConnection,
     filter,
     plan::{self, ItemsRequest, Pagination},
-    store::{CachedBody, Error, QueryFn, Store},
+    store::{gzip_body, CachedBody, Error, QueryFn, Store},
 };
 use bytes::Bytes;
 use poem::{
@@ -140,37 +140,22 @@ pub fn conditional_response(req: &Request, body: &CachedBody, content_type: &str
     }
 }
 
-/// Serve a cached body, negotiating a stored gzip variant when the client
-/// accepts it. The encoding is checked first: a surviving gzip entry serves
-/// without touching the identity bytes or the database. The compressed
-/// variant shares the same byte budget; `compressed` does no database work
-/// and consumes no pool connection.
+/// Serve a fresh body, negotiating gzip when the client accepts it. Every
+/// request runs its query; compression is pure CPU on a blocking thread and
+/// consumes no pool connection.
 pub async fn body_response(
     req: &Request,
     store: &Store,
-    key: String,
     heavy: bool,
     query: QueryFn,
     content_type: &str,
 ) -> Result<Response, Error> {
     store.note_http();
-    if wants_gzip(req) {
-        let gzip_key = format!("{key}:gzip");
-        if let Some(hit) = store.get(&gzip_key).await {
-            return Ok(if if_none_match(req, &hit.etag) {
-                not_modified(&hit.etag)
-            } else {
-                gzip_response(&hit, content_type)
-            });
-        }
-    }
-    let body = store.bytes(key.clone(), heavy, query).await?;
+    let body = store.run_bytes(heavy, query).await?;
     if !wants_gzip(req) {
         return Ok(conditional_response(req, &body, content_type));
     }
-    let gzip_key = format!("{key}:gzip");
-    let raw = body.bytes.clone();
-    let gzipped = store.compressed(gzip_key, raw).await?;
+    let gzipped = gzip_body(body.bytes.clone()).await?;
     if if_none_match(req, &gzipped.etag) {
         Ok(not_modified(&gzipped.etag))
     } else {
@@ -240,30 +225,13 @@ fn conformance(Query(_): Query<NoQuery>) -> Response {
 fn health(Query(_): Query<NoQuery>) -> &'static str {
     "ok"
 }
-/// Point-in-time pool cache counters for capacity experiments. Plain text
-/// with `no-store`: hit rate over lookups is `(hits + coalesced) /
-/// requests`; `http_requests` counts HTTP responses attempted (one request
-/// can cause up to two lookups: gzip then identity); `failures` counts miss
-/// executions that errored and were not cached. Storage-block caching lives
-/// in ZeroFS below the mount; `duck_setting_*` lines report engine budgets
-/// only.
+/// Point-in-time counters: HTTP responses served plus engine budgets.
+/// Storage-block caching lives in Cachey; `duck_setting_*` lines report
+/// engine budgets only.
 #[handler]
 async fn metrics(Query(_): Query<NoQuery>, Data(store): Data<&Arc<Store>>) -> Response {
-    let stats = store.cache_stats();
-    let tuning = store.duck_tuning().await;
-    let mut out = format!(
-        "cache_entries {}\ncache_weight_bytes {}\ncache_requests {}\nhttp_requests {}\ncache_hits {}\ncache_coalesced {}\ncache_computes {}\ncache_failures {}\ncache_evictions {}\n",
-        stats.entries,
-        stats.weight_bytes,
-        stats.requests,
-        stats.http_requests,
-        stats.hits,
-        stats.coalesced,
-        stats.computes,
-        stats.failures,
-        stats.evictions,
-    );
-    for (key, value) in tuning {
+    let mut out = format!("http_requests {}\n", store.http_requests());
+    for (key, value) in store.duck_tuning().await {
         out.push_str(&format!("duck_setting_{key} {value}\n"));
     }
     Response::builder()
@@ -509,11 +477,10 @@ async fn items(
         datetime: query.datetime.clone(),
     };
     let href = normalized.href();
-    let key = normalized.cache_key();
     let heavy = plan::is_heavy(query.limit, &pagination, bounds);
     let started = std::time::Instant::now();
-    // SQL construction happens on miss inside the closure: hits pay for
-    // validation, canonical-key creation, lookup and response assembly only.
+    // SQL construction happens inside the worker: the handler pays for
+    // validation and response assembly only.
     // A cursor bounds the id range, so DuckDB starts at the page instead of
     // discarding `offset` leading rows. Offset stays for direct links.
     let limit = query.limit;
@@ -586,7 +553,7 @@ async fn items(
         );
         Ok(bytes)
     });
-    let response = body_response(req, store, key, heavy, query, kind).await;
+    let response = body_response(req, store, heavy, query, kind).await;
     tracing::debug!(total_ms = started.elapsed().as_millis(), "ogc items serve");
     response.map_err(|e| e.into())
 }
@@ -601,9 +568,8 @@ async fn item(
     store.collection(&collection)?;
     let kind = geojson_type(req)?;
     let sources = source_ids(req, query.sources.as_deref())?;
-    // Key and SQL both derive from the normalized inputs; SQL builds on
-    // miss so hits pay validation + lookup only.
-    let key = plan::item_key(&collection, &id, &sources);
+    // SQL builds per request; equivalent spellings normalize to the same
+    // predicate through the validated inputs.
     let query: QueryFn = Box::new(move |conn: &NeoConnection| {
         let sql = format!(
             "SELECT {FEATURE_COLUMNS}, layer, source_id::VARCHAR FROM features WHERE id = {} LIMIT 1",
@@ -641,7 +607,7 @@ async fn item(
         )?;
         Ok(Bytes::from(serde_json::to_vec(&single)?))
     });
-    body_response(req, store, key, false, query, kind)
+    body_response(req, store, false, query, kind)
         .await
         .map_err(|e| e.into())
 }

@@ -1,7 +1,7 @@
 //! XYZ MVT extension. Spatial filtering is CRS84; tile encoding is Web Mercator.
 use crate::{
     api::{self, SourceQuery},
-    db, filter, plan,
+    db, filter,
     store::{Error, Store},
 };
 use bytes::Bytes;
@@ -30,12 +30,11 @@ pub async fn tile(
     let span = 2.0 * half / f64::from(1u32 << z);
     let west = -half + f64::from(x) * span;
     let north = half - f64::from(y) * span;
-    // Key derives from the normalized inputs; SQL builds on miss so hits
-    // pay validation + lookup only. Tiles hold up to 5k features and run
-    // Mercator transforms, so they share the bulk lane with Flight.
-    let key = plan::tile_key(z, x, y, &collection, &sources);
+    // SQL builds per request; validation runs before any database work.
+    // Tiles hold up to 5k features and run Mercator transforms, so they
+    // share the bulk lane with Flight.
     let body = store
-        .bytes(key, true, move |conn| {
+        .run_bytes(true, move |conn| {
             // Predicates build inside the worker: the cached path never
             // formats SQL.
             let fetch = Store::predicate(&collection, Some(bbox), &sources);
