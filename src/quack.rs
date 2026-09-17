@@ -32,7 +32,8 @@
 use crate::{
     db::{self, NeoConnection, NeoDatabase},
     store::{
-        attach_options, cachey_secret_sql, cachey_secret_sql_named, http_origin, Error, StoreConfig,
+        attach_options, cachey_secret_sql, cachey_secret_sql_named, disable_late_materialization,
+        http_origin, Error, StoreConfig,
     },
 };
 use duckdb_neo::Parameters;
@@ -175,6 +176,7 @@ fn setup_quack_session(
             "SET validate_external_file_cache='NO_VALIDATION'",
         ],
     )?;
+    disable_late_materialization(conn);
     // Same Cachey request-config header as the serving pool: the guard
     // installed below rejects secret creation, so this runs before it.
     if let Some(secret) = cachey_secret_sql(catalog) {

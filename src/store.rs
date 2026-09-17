@@ -489,16 +489,15 @@ const EXPECTED_FEATURE_SCHEMA: [(&str, &str); 13] = [
     ("name", "VARCHAR"),
 ];
 
-/// Resolve the serving FROM clause (see [`Store::table_from`]). DuckLake
-/// answers every catalog-table query through a snapshot/delete-filter join
-/// over (filename, file_row_number) — measured ~2-3x the bytes and ~2x the
-/// time of reading the same Parquet directly, with per-window plan flips on
-/// top. Our publishes are additive-only (data files never deleted or
-/// rewritten, inlined data flushed, no row deletes), so the live file list
-/// at the pinned snapshot is the whole truth and `read_parquet` over it
-/// serves identical rows without the join. Every guard below fails closed
-/// to catalog reads: a foreign catalog (deletes, inlined rows, evolved
-/// schema, empty table) serves exactly as before, only slower.
+/// Resolve the serving FROM clause (see [`Store::table_from`]). Catalog-table
+/// reads carry ~16 ms of DuckLake per-query overhead versus reading the same
+/// Parquet directly at identical bytes read (measured). Our publishes are
+/// additive-only (data files never deleted or rewritten, inlined data
+/// flushed, no row deletes), so the live file list at the pinned snapshot
+/// is the whole truth and `read_parquet` over it serves identical rows
+/// without that overhead. Every guard below fails closed to catalog reads:
+/// a foreign catalog (deletes, inlined rows, evolved schema, empty table)
+/// serves exactly as before, only slower.
 fn resolve_table_source(
     conn: &NeoConnection,
     snapshot: i64,
@@ -743,6 +742,19 @@ pub(crate) fn s3_secret_sql(endpoint: &str, key_id: &str, secret: &str) -> Strin
     )
 }
 
+/// Late materialization rewrites small-LIMIT scans into a row-id-driven
+/// double read: measured ~2x bytes and latency on small OGC pages at the
+/// default 50-row threshold (our limit=10 pages fetch 11 rows and flip;
+/// limit=100 pages never do). Serving scans are Top-N over clustered
+/// Parquet where the straight scan wins, so disable it. Best-effort: this
+/// is a DEBUG setting and a future engine may rename it; failure only
+/// costs the optimization, never correctness or startup.
+pub(crate) fn disable_late_materialization(conn: &NeoConnection) {
+    if let Err(e) = db::execute_all(conn, &["SET late_materialization_max_rows=0"]) {
+        tracing::warn!(error = %e, "late materialization tuning not applied");
+    }
+}
+
 /// Full per-connection setup: extensions, then the catalog attach pinned to
 /// `snapshot`. Every pooled connection runs the session part; the ATTACH
 /// itself is database-level and done once (see [`Store::open_config`]).
@@ -792,7 +804,9 @@ fn setup_session(conn: &NeoConnection, cfg: &StoreConfig, _remote: bool) -> Resu
             "SET enable_http_metadata_cache=true",
             "SET validate_external_file_cache='NO_VALIDATION'",
         ],
-    )
+    )?;
+    disable_late_materialization(conn);
+    Ok(())
 }
 
 impl Store {

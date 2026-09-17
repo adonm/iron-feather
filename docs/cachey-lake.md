@@ -165,40 +165,56 @@ dominates. Diagnostic (2026-09-17, identical 20k ids served from local
 files vs Cachey vs a native DuckDB table, threads=1, warm) found two
 compounding causes, both now pulled:
 
-- DuckLake answered every catalog-table query through a
-  snapshot/delete-filter join over `(filename, file_row_number)` —
-  ~2–3x the bytes and ~2x the time of reading the same Parquet directly
-  (10.2 MB read for a 3.3 KB response; the 1 km/100-feature query planned
-  as a single scan at 5.5 MB while the 100 m/2-feature query took the
-  double-scan join — fewer matches cost more). Serving reads now resolve
-  at startup to a frozen `read_parquet([...])` over the exact files live
-  at the pinned snapshot (`Store::table_from`). Guards fail closed to
-  catalog reads: snapshot-scoped file/schema segments, zero live delete
-  files and inlined deletes/rows, expected builder schema, non-empty file
-  list. Unit tests prove byte-identical pages and delete fallback.
+- Small-LIMIT scans took a row-id-driven double read: DuckDB's late
+  materialization (default 50-row threshold) rewrites Top-N queries
+  fetching ≤50 rows into a filter pass plus a row-id fetch pass. Our
+  limit=10 pages fetch 11 rows and flip; limit=100 pages never do — which
+  is why fewer matches cost more. Correction to an earlier note: this is
+  the optimizer, not DuckLake snapshot machinery; the join appears on
+  direct-Parquet reads too. Serving sessions now set
+  `late_materialization_max_rows=0` (best-effort: DEBUG setting, warn and
+  continue if a future engine renames it). Separately, catalog-table reads
+  still carry ~16 ms of DuckLake per-query overhead at identical bytes
+  read, so the frozen file-list serving (`Store::table_from`, guards fail
+  closed to catalog reads) stays.
 - The fixture file held a single row group (`row_group 65536` > 20k
   rows), so `xmin/xmax` zone maps pruned at file granularity only.
   Row-group default is now 8192 (measured on direct reads: 44 ms at 1
-  group, 28 ms at 3, 22 ms at 10). Row groups did nothing on the DuckLake
-  path (71→76→72 ms across the curve — the join dominated), which is why
-  the bypass came first. Killed ideas, measured: `properties::VARCHAR`
-  cast costs nothing (28 vs 28.5 ms); the ids→full gap is payload-column
-  decode, not conversion.
+  group, 28 ms at 3, 22 ms at 10). Killed ideas, measured:
+  `properties::VARCHAR` cast costs nothing (28 vs 28.5 ms); the ids→full
+  gap is payload-column decode, not conversion.
 
-| backend, warm conc=1 | before | after |
-|---|---|---|
-| local files, diag mix p50 | ~72 ms | ~29 ms |
-| local files, 100 m / 2-feature shape | ~72 ms | ~25–41 ms |
-| local files, limit=100 shape | ~37 ms | ~15–17 ms |
-| warm Cachey, diag mix p50 | ~73 ms | ~43–58 ms, 0 new S3 downloads over 24 steady-state reqs |
+Engine A/B (Berlin 20k, EXPLAIN ANALYZE medians, Data Read):
+
+| query | catalog thr50 | catalog thr0 | file-list thr50 | file-list thr0 |
+|---|---|---|---|---|
+| 100 m / 4-hit page | 79.5 ms, 10.8 MB | 31.1 ms, 5.7 MB | 25.5 ms, 10.9 MB | 14.3 ms, 5.7 MB |
+| 4 km / 100-hit page | 35.2 ms, 5.7 MB | 35.3 ms, 5.7 MB | 18.4 ms, 5.7 MB | 18.6 ms, 5.7 MB |
+
+Server A/B (500-URL mixed workload, sequential client; bodies
+byte-identical across all runs, corpus sha256 `7dc46135…` on every
+backend):
+
+| backend | small p50 (A→B) | limit=100 p50 | p99 small |
+|---|---|---|---|
+| local files | 36.0 → 20.8 ms | 24.7 → 24.4 ms | 88.8 → 65.5 ms |
+| warm Cachey | 53.1 → 30.8 ms | 35.9 → 36.1 ms | 114.5 → 69.6 ms |
+
+Warm-Cachey fixed-pass (`http_bench`, conc=4): rps 194 → 246, p50
+17.3 → 14.2 ms, 0 failed downloads on either pass; Cachey page accesses
+453 → 335 (−26%) and fetch bytes 491 → 362 MB for the identical request
+set. 25M-row fixture (file-list both sides, all rows agree): Amsterdam
+small page 180 → 104 ms; Paris/Brussels small pages flat (~240/~120 ms)
+— the join is gone there too, but the base scan over 128 MB/64k-RG files
+dominates, so bytes saved do not always convert to latency saved.
 
 Server assembly/encode is microseconds per the `ogc items render`
 `candidate_us`/`fetch_us` debug split — DuckDB time is the total.
-Concurrency 1/4/8 leaves local p50 flat while rps scales: no queueing,
-latency is per-query work. Residual floor for a novel 2-feature URL is
-~25 ms (scan + payload decode + ~4 ms planning + server); sub-10 needs
-plan caching (prepared statements), more threads per query, or a shared
-response cache — storage caching cannot close it. The old 2,000-4,500 rps
+Concurrency leaves p50 flat while rps scales: no queueing, latency is
+per-query work. Residual floor for a novel small URL is ~20 ms (scan +
+payload decode + ~4 ms planning + server); sub-10 needs plan caching
+(prepared statements), more threads per query, or a shared response
+cache — storage caching cannot close it. The old 2,000-4,500 rps
 figures measured the removed per-pod app cache on repeated URLs, not
 storage: with it gone, per-unique-request work is unchanged by design
 (it never hit the app cache), and zone-shared Cachey is what absorbs

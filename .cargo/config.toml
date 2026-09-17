@@ -1,0 +1,8 @@
+# Always link/stage the pinned prebuilt engine from .deps/duckdb
+# (`just setup-duckdb`), even for bare `cargo` invocations outside just.
+# Without this, libduckdb-sys falls back to downloading its own rolling
+# libduckdb into target/duckdb-download, whose ABI can differ from the
+# pinned one (previously broke `cargo run`/`cargo test` with an undefined
+# v2 symbol while direct binary runs worked).
+[env]
+DUCKDB_LIB_DIR = { value = ".deps/duckdb", relative = true }
