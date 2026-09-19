@@ -2,11 +2,12 @@
 
 > **Rename + rewrite note:** this repo was `iron-feather` (Rust, poem + tonic,
 > Cachey HTTP reads). It is now `lakewing` (Go, Huma OGC + Arrow Flight,
-> mountpoint-S3-CSI reads, direct-S3 writes, SeaweedFS local rig). The Rust
-> sources are gone; `just check test build` covers the Go module. The
-> DuckDB 2.0 line rides `duckdb-go v2.20000.0-6.preview` until the 2.0 GA
-> binding lands. Full parity (build/index wiring, Flight serving, ETag/gzip
-> middleware, k8s seed port) is in progress.
+> mountpoint-S3-CSI reads, direct-S3 writes, SeaweedFS local rig). `build`,
+> `index` and `serve` (OGC + tiles + Flight) are wired against DuckDB 2.0
+> (`v2.0.0-alpha42069` via `-tags=duckdb_use_lib`; the preview binding's
+> bundled engine is 1.5.x and cannot open 2.0 catalogs). Remaining deltas
+> from the old stack: Flight load-benchmarks, refreshed OpenAPI snapshot,
+> kind CSI-driver install against real S3 (kind runs hostPath).
 
 **Build a DuckLake snapshot on S3, then serve it through OGC REST and Arrow Flight.**
 
@@ -304,4 +305,7 @@ These are not universal capacity claims; run the included tools on the target
 CPU, storage, shard size and response shape.
 
 `just check test` runs gofmt, `go vet` and the Go unit suites (filter,
-plan, index, Flight ticket validation).
+plan, index, Flight ticket validation). `just test-duckdb` boots the pooled
+store over the fixture catalog (DuckDB 2.0 smoke: extensions, pinned
+snapshot, frozen file list, pruned query). `just test-mount-cache`
+validates mountpoint disk caching against SeaweedFS over real FUSE.

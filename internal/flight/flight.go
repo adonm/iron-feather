@@ -13,31 +13,35 @@ import (
 )
 
 var allowedColumns = map[string]string{
-	"id":         "id",
-	"geometry":   "ST_AsWKB(geom) AS geometry",
-	"properties": "properties::VARCHAR AS properties",
-	"source_id":  "source_id",
-	"x":          "cx AS x",
-	"y":          "cy AS y",
-	"name":       "name",
+	"id":         "page.id",
+	"geometry":   "ST_AsWKB(page.geom) AS geometry",
+	"properties": "page.properties::VARCHAR AS properties",
+	"source_id":  "page.source_id",
+	"x":          "page.cx AS x",
+	"y":          "page.cy AS y",
+	"name":       "page.name",
 }
 
-// Ticket mirrors flight::ShardTicket.
+// Ticket mirrors flight::ShardTicket. BBox stays a raw number list so 3D
+// bounds validate like the OGC path instead of failing JSON shape.
 type Ticket struct {
-	Collection string      `json:"collection"`
-	BBox       *[4]float64 `json:"bbox"`
-	Columns    []string    `json:"columns"`
-	Limit      *int        `json:"limit"`
-	Offset     *int        `json:"offset"`
-	Sources    []int64     `json:"sources"`
+	Collection string    `json:"collection"`
+	BBox       []float64 `json:"bbox"`
+	Columns    []string  `json:"columns"`
+	Limit      *int      `json:"limit"`
+	Offset     *int      `json:"offset"`
+	Sources    []int64   `json:"sources"`
 }
 
-// Validate mirrors flight validation: unknown/dup columns rejected,
-// limit default 10k capped at 100k.
+// Validate mirrors flight validation: nil columns take defaults, explicit
+// empty is rejected like unknown/duplicates; limit defaults to 10k, max 100k.
 func (t Ticket) Validate() ([]string, int, int, error) {
 	cols := t.Columns
-	if len(cols) == 0 {
+	if cols == nil {
 		cols = []string{"id", "geometry", "properties", "source_id"}
+	}
+	if len(cols) == 0 {
+		return nil, 0, 0, fmt.Errorf("columns must not be empty")
 	}
 	seen := map[string]bool{}
 	for _, c := range cols {
@@ -72,25 +76,21 @@ func (t Ticket) SQL(st *store.Store, sources []int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	var bounds *[4]float64
+	if t.BBox != nil {
+		b, err := filter.BBox(t.BBox)
+		if err != nil {
+			return "", err
+		}
+		bounds = &b
+	}
 	proj := make([]string, len(cols))
 	for i, c := range cols {
 		proj[i] = allowedColumns[c]
 	}
-	from := st.ReadSource(t.BBox)
-	fetch := store.Predicate(t.Collection, t.BBox, sources)
+	from := st.ReadSource(bounds)
+	fetch := store.Predicate(t.Collection, bounds, sources)
 	inner := fmt.Sprintf("SELECT id, geom, properties, source_id, cx, cy, name FROM %s WHERE %s ORDER BY id LIMIT %d OFFSET %d",
 		from, fetch, limit, offset)
-	// Rewrite centroid/name exprs to the page alias, mirroring Rust.
-	rewritten := make([]string, len(proj))
-	for i, p := range proj {
-		r := strings.ReplaceAll(p, "cx AS x", "page.cx AS x")
-		r = strings.ReplaceAll(r, "cy AS y", "page.cy AS y")
-		r = strings.ReplaceAll(r, "ST_AsWKB(geom) AS geometry", "ST_AsWKB(page.geom) AS geometry")
-		r = strings.ReplaceAll(r, "properties::VARCHAR AS properties", "page.properties::VARCHAR AS properties")
-		r = strings.ReplaceAll(r, "source_id", "page.source_id")
-		r = strings.ReplaceAll(r, "page.page.", "page.")
-		rewritten[i] = r
-	}
-	_ = filter.Quote
-	return fmt.Sprintf("SELECT %s FROM (%s) AS page ORDER BY id", strings.Join(rewritten, ", "), inner), nil
+	return fmt.Sprintf("SELECT %s FROM (%s) AS page ORDER BY id", strings.Join(proj, ", "), inner), nil
 }

@@ -1,5 +1,7 @@
 {{- /* Static-provisioned mountpoint-S3-CSI volume for the lake bucket.
-     Readers mount this; writers never mount (direct S3 writes). */ -}}
+     Readers mount this; writers never mount (direct S3 writes).
+     Disabled for kind (csi.enabled=false), where the PVC is hostPath. */ -}}
+{{- if .Values.csi.enabled }}
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -36,3 +38,4 @@ spec:
     requests:
       storage: 1200Gi
   volumeName: {{ include "lakewing.fullname" . }}-lake
+{{- end }}

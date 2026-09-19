@@ -1,21 +1,35 @@
-# Go via mise/toolchain, just via mise. DuckDB 2.0 preview lib is bundled by
-# duckdb-go (CGO); no prebuilt .deps wiring needed for the app build.
-GO := "go"
+# Go via mise/toolchain, just via mise. DuckDB 2.0 links the pinned
+# prebuilt library in .deps/duckdb (populated by `just setup-duckdb`):
+# the preview binding's bundled engine is 1.5.x and cannot open 2.0
+# catalogs, so every Go command builds with duckdb_use_lib.
+DUCKDB_DIR := justfile_directory() + "/.deps/duckdb"
+export CGO_LDFLAGS := "-L" + DUCKDB_DIR
+export LD_LIBRARY_PATH := DUCKDB_DIR
+export DYLD_LIBRARY_PATH := DUCKDB_DIR
+export GOFLAGS := "-tags=duckdb_use_lib"
 
 default: check
 
-setup:
-    {{GO}} mod download
+setup: setup-duckdb
+    go mod download
 
-check:
+setup-duckdb:
+    python3 scripts/setup_duckdb.py
+
+check: setup-duckdb
     gofmt -l cmd internal
-    {{GO}} vet ./...
+    go vet ./...
 
-test:
-    {{GO}} test ./...
+test: setup-duckdb
+    go test ./...
 
-build:
-    {{GO}} build ./...
+# Real-DuckDB smoke: boots the pooled store over the fixture catalog
+# (needs the 2.0 prebuilt lib + fixture files).
+test-duckdb shard="fixtures/nw-europe.ducklake": setup-duckdb
+    LAKEWING_TEST_SHARD="{{justfile_directory()}}/{{shard}}" go test -count=1 ./internal/store/ -run TestPreviewSmoke -v
+
+build: setup-duckdb
+    go build ./...
 
 fmt:
     gofmt -w cmd internal
@@ -27,11 +41,11 @@ fmt-check:
 
 # Tiny Berlin slice for fast iteration (add --limit 20000).
 fixture-osm *args:
-    {{GO}} run ./cmd/lakewing build --bbox=13.35,52.48,13.45,52.55 {{args}}
+    go run ./cmd/lakewing build --bbox=13.35,52.48,13.45,52.55 {{args}}
 
 # ~3 GB / 25M-row Benelux + northern France buildings for capacity work.
 fixture-nw-europe out="fixtures/nw-europe.ducklake" datadir="fixtures/nw-europe.files" *args:
-    {{GO}} run ./cmd/lakewing build --bbox=2,48,6,54 --out {{quote(out)}} --data-dir {{quote(datadir)}} {{args}}
+    go run ./cmd/lakewing build --bbox=2,48,6,54 --out {{quote(out)}} --data-dir {{quote(datadir)}} {{args}}
 
 # Row counts and collections for a built shard (DuckDB CLI for poking).
 fixture-verify shard="fixtures/nw-europe.ducklake":
@@ -88,7 +102,7 @@ lake-publish sha *args: seaweed-up
       echo "catalog key $name already published; refusing to overwrite" >&2
       exit 1
     fi
-    {{GO}} run ./cmd/lakewing build --out "$STAGE/$name" --content-address \
+    go run ./cmd/lakewing build --out "$STAGE/$name" --content-address \
       --data-dir "$STAGE/files" --data-url "s3://lake/data/" {{args}}
     rclone copy "$STAGE/files" lake:lake/data/
     rclone copyto "$STAGE/$name" "lake:lake/catalogs/$name"
@@ -104,7 +118,7 @@ lake-serve ref="latest" mnt="/tmp/opencode/mnt/lake" *args: seaweed-up
     set -euo pipefail
     catalog=$(bash scripts/lake_ref.sh get {{quote(ref)}})
     [ -n "$catalog" ] || { echo "empty ref {{quote(ref)}}" >&2; exit 1; }
-    {{GO}} run ./cmd/lakewing serve --shard "{{quote(mnt)}}/catalogs/$catalog" --data-root "{{quote(mnt)}}/data/" {{args}}
+    go run ./cmd/lakewing serve --shard "{{quote(mnt)}}/catalogs/$catalog" --data-root "{{quote(mnt)}}/data/" {{args}}
 
 # Smoke-check a running lake server (default: local :3000).
 lake-verify base="http://127.0.0.1:3000":
@@ -116,7 +130,7 @@ lake-verify base="http://127.0.0.1:3000":
     curl -s "{{base}}/metrics" | head -12
 
 run shard="fixtures/osm.ducklake" *args:
-    {{GO}} run ./cmd/lakewing serve --shard {{quote(shard)}} {{args}}
+    go run ./cmd/lakewing serve --shard {{quote(shard)}} {{args}}
 
 # --- kind whole-stack ------------------------------------------------------
 kind-up:
@@ -135,18 +149,31 @@ kind-image:
     docker build -t lakewing:kind .
     kind load docker-image lakewing:kind --name lake
 
-# Install/upgrade the whole stack (CSI-mounted read pool).
+# Install/upgrade the whole stack (CSI-mounted read pool + bulk pool).
 kind-install *args:
-    helm upgrade --install lake charts/lakewing --namespace lake --create-namespace --set image.tag=kind {{args}}
+    helm upgrade --install lake charts/lakewing --namespace lake --create-namespace -f k8s/kind-values.yaml --set image.tag=kind {{args}}
 
 kind-status:
     kubectl -n lake get pods,deployments,services 2>&1 | head -30
 
-# Seed the lake with the Berlin snapshot (same shape as the writer).
+# Seed the kind lake: build the Berlin snapshot and stage it onto the
+# az-a worker's /nvme hostPath (catalogs/ + data/ + sidecars), then
+# provision the hostPath PV/PVC the chart mounts with csi.enabled=false.
 kind-seed:
-    kubectl apply -f k8s/seed-job.yaml
-    kubectl -n lake wait --for=condition=complete --timeout=1200s job/lake-seed-berlin
-    kubectl -n lake logs job/lake-seed-berlin | tail -2
+    #!/usr/bin/env bash
+    set -euo pipefail
+    go run ./cmd/lakewing build --bbox=13.35,52.48,13.45,52.55 --limit 20000 \
+      --collection buildings --content-address \
+      --out /tmp/opencode/kind-seed/sha_seed.ducklake \
+      --data-dir /tmp/opencode/kind-seed/files \
+      --data-url 's3://lake/data/'
+    dest=/tmp/opencode/kind-nvme-a/lake
+    mkdir -p "$dest/catalogs" "$dest/data"
+    cp /tmp/opencode/kind-seed/sha_seed.ducklake* "$dest/catalogs/"
+    cp -r /tmp/opencode/kind-seed/files/. "$dest/data/"
+    ls "$dest/catalogs"
+    kubectl create namespace lake --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -f k8s/kind-data.yaml
 
 # Berlin benchmark against a port-forwarded read pool.
 kind-bench base="http://127.0.0.1:3000" workload="workloads/berlin/mixed.txt": workloads-berlin

@@ -4,12 +4,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -18,6 +20,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/spf13/cobra"
 
+	"github.com/adonm/lakewing/internal/filter"
+	"github.com/adonm/lakewing/internal/flight"
 	"github.com/adonm/lakewing/internal/materialize"
 	"github.com/adonm/lakewing/internal/ogc"
 	"github.com/adonm/lakewing/internal/store"
@@ -37,26 +41,32 @@ func buildCmd() *cobra.Command {
 	var fileMB, rowGroup int
 	var sourceID int64
 	var contentAddress bool
-	var s3Endpoint, s3KeyID, s3Secret string
 	cmd := &cobra.Command{
 		Use:   "build",
 		Short: "Build a DuckLake snapshot (direct S3 writes)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_ = materialize.SortGrid
-			fmt.Fprintf(cmd.OutOrStdout(), "build: from=%s collection=%s bbox=%s out=%s (direct write; run against S3, not the mount)\n", from, collection, bboxRaw, out)
-			_, _ = limit, fileMB
-			_, _ = rowGroup, sourceID
-			_, _ = contentAddress, dataDir
-			_, _ = dataURL, sort
-			_, _ = s3Endpoint, s3KeyID
-			_ = s3Secret
-			return fmt.Errorf("build: not yet wired to DuckDB 2.0 preview in this scaffold increment")
+			bbox, err := filter.ParseBBox(bboxRaw)
+			if err != nil {
+				return err
+			}
+			spec := materialize.Spec{
+				From: from, Collection: collection, BBox: bbox,
+				Out: out, DataDir: dataDir, DataURL: dataURL,
+				FileMB: uint64(fileMB), RowGroup: uint64(rowGroup),
+				Sort: materialize.SortOrder(sort), SourceID: sourceID,
+				ContentAddress: contentAddress,
+			}
+			if limit > 0 {
+				spec.Limit = &limit
+			}
+			_, err = materialize.Run(cmd.Context(), spec)
+			return err
 		},
 	}
 	cmd.Flags().StringVar(&from, "from", "https://data.openstreetmap.us/layercake/buildings.parquet", "input GeoParquet")
 	cmd.Flags().StringVar(&collection, "collection", "buildings", "collection id")
 	cmd.Flags().StringVar(&bboxRaw, "bbox", "", "required CRS84 w,s,e,n")
-	cmd.Flags().StringVar(&out, "out", "fixtures/osm.ducklake", "output catalog (staging path or s3 key)")
+	cmd.Flags().StringVar(&out, "out", "fixtures/osm.ducklake", "output catalog path")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "fixtures/osm.files", "staging data dir")
 	cmd.Flags().StringVar(&dataURL, "data-url", "", "portable DATA_PATH (s3:// prefix for lake publishes)")
 	cmd.Flags().Int64Var(&limit, "limit", 0, "development row cap (0 = none)")
@@ -65,9 +75,6 @@ func buildCmd() *cobra.Command {
 	cmd.Flags().StringVar(&sort, "sort", "grid", "grid|hilbert|none")
 	cmd.Flags().Int64Var(&sourceID, "source-id", 1, "source id stamp")
 	cmd.Flags().BoolVar(&contentAddress, "content-address", false, "name data files by content hash")
-	cmd.Flags().StringVar(&s3Endpoint, "s3-endpoint", "", "direct-S3 endpoint for writes")
-	cmd.Flags().StringVar(&s3KeyID, "s3-key-id", "", "direct-S3 key id")
-	cmd.Flags().StringVar(&s3Secret, "s3-secret", "", "direct-S3 secret")
 	_ = cmd.MarkFlagRequired("bbox")
 	return cmd
 }
@@ -78,15 +85,36 @@ func indexCmd() *cobra.Command {
 		Use:   "index",
 		Short: "Compile a serving index sidecar for an existing catalog",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Fprintf(cmd.OutOrStdout(), "index: shard=%s out=%s\n", shard, out)
-			_, _ = dataDir, out
-			return fmt.Errorf("index: not yet wired in this scaffold increment")
+			if out == "" {
+				out = shard + ".serving.json"
+			}
+			abs, err := filepath.Abs(dataDir)
+			if err != nil {
+				return err
+			}
+			doc, err := materialize.GenerateIndex(cmd.Context(), shard, abs)
+			if err != nil {
+				return err
+			}
+			pretty, _ := json.MarshalIndent(doc, "", "  ")
+			if dir := filepath.Dir(out); dir != "" {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					return err
+				}
+			}
+			if err := os.WriteFile(out, pretty, 0o644); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "indexed %d files in %d partitions -> %s\n",
+				len(doc.Files), len(doc.Partitions), out)
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&shard, "shard", "", "catalog path (mount path)")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "", "data root (mount path)")
 	cmd.Flags().StringVar(&out, "out", "", "output sidecar (default <shard>.serving.json)")
 	_ = cmd.MarkFlagRequired("shard")
+	_ = cmd.MarkFlagRequired("data-dir")
 	return cmd
 }
 
@@ -132,16 +160,27 @@ func serveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// A bind/runtime failure in either listener terminates the service.
+			errCh := make(chan error, 2)
 			go func() {
-				<-ctx.Done()
+				if err := httpSrv.Serve(lc); err != http.ErrServerClosed {
+					errCh <- err
+				}
+			}()
+			go func() {
+				if err := flight.Serve(ctx, flightListen, st); err != nil {
+					errCh <- err
+				}
+			}()
+			select {
+			case err := <-errCh:
+				return err
+			case <-ctx.Done():
 				shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				httpSrv.Shutdown(shutCtx)
-			}()
-			// Flight listener is wired in the full increment; fail loud if
-			// the port is taken so single-port deploys surface fast.
-			_ = flightListen
-			return httpSrv.Serve(lc)
+				_ = httpSrv.Shutdown(shutCtx)
+				return nil
+			}
 		},
 	}
 	cmd.Flags().StringVar(&shard, "shard", "", "mount path to the .ducklake catalog (e.g. /mnt/lake/catalogs/<sha>.ducklake)")

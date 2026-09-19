@@ -3,7 +3,11 @@
 // against partition bboxes in memory and hands DuckDB only candidate files.
 package index
 
-import "math"
+import (
+	"fmt"
+	"math"
+	"strings"
+)
 
 const Version uint32 = 1
 
@@ -54,6 +58,45 @@ func BBoxesOverlap(a, b [4]float64) bool {
 		}
 	}
 	return false
+}
+
+// BuildIndex ports index::build_index (minus footer reads): compile a
+// serving index over catalog-ordered DATA-relative paths with their footer
+// bboxes. Absolute relpaths are rejected: they would bake one machine's
+// disk layout into the document.
+func BuildIndex(ducklakeCommit int64, relpaths []string, stats [][4]float64) (ServingIndex, error) {
+	if len(relpaths) != len(stats) {
+		return ServingIndex{}, fmt.Errorf("file URL list and relative path list disagree")
+	}
+	for _, p := range relpaths {
+		if strings.Contains(p, "://") || strings.HasPrefix(p, "/") {
+			return ServingIndex{}, fmt.Errorf("absolute data file paths cannot be indexed")
+		}
+	}
+	files := make([]IndexedFile, len(relpaths))
+	for i := range relpaths {
+		files[i] = IndexedFile{Path: relpaths[i], BBox: stats[i]}
+	}
+	var extent *[4]float64
+	for i := range stats {
+		b := stats[i]
+		if extent == nil {
+			c := b
+			extent = &c
+		} else {
+			e := *extent
+			e = [4]float64{min(e[0], b[0]), min(e[1], b[1]), max(e[2], b[2]), max(e[3], b[3])}
+			extent = &e
+		}
+	}
+	if extent == nil {
+		return ServingIndex{}, fmt.Errorf("no files to index")
+	}
+	perAxis := int(math.Ceil(math.Sqrt(float64(len(relpaths)))))
+	bboxes := make([][4]float64, len(stats))
+	copy(bboxes, stats)
+	partitions, cell := PartitionFiles(*extent, bboxes, perAxis)
+	return ServingIndex{Version: Version, DuckLakeCommit: ducklakeCommit, Cell: cell, Files: files, Partitions: partitions}, nil
 }
 
 // PruneFiles returns file indices whose bbox may intersect bounds, in file
