@@ -76,7 +76,7 @@ def main() -> None:
     files = {}
 
     # Hot set: a few dense windows hit by every worker -> repeated pages
-    # absorbed by zone-shared Cachey (and DuckDB buffers).
+    # absorbed by the mount-local disk cache (and DuckDB buffers).
     hot = []
     for name, lon, lat in cities[:3]:
         hot.append(items(window(lon, lat, 0.005), 10))

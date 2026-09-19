@@ -46,9 +46,9 @@ workloads-berlin dir="workloads/berlin":
     python3 scripts/make_berlin_workload.py --out-dir {{quote(dir)}}
 
 # --- SeaweedFS lake rig ------------------------------------------------------
-# Local rehearsal of the mount design (see docs/cachey-lake.md, now the
-# mount migration notes): SeaweedFS (S3) for direct writes + a mount-s3
-# mount for reads, the local equivalent of mountpoint-S3-CSI.
+# Local rehearsal of the mount design (see docs/mount-lake.md): SeaweedFS
+# (S3) for direct writes + a mount-s3 mount with local disk cache for reads,
+# the local equivalent of mountpoint-S3-CSI.
 
 # Start SeaweedFS (idempotent).
 seaweed-up:
@@ -61,6 +61,11 @@ seaweed-down *args:
 # Mount the lake bucket locally (needs mount-s3 + seaweed-up).
 lake-mount mnt="/tmp/opencode/mnt/lake":
     bash scripts/lake_mount.sh {{quote(mnt)}}
+
+# Validate mountpoint disk caching against real SeaweedFS over real FUSE:
+# cold / warm / cache-dropped scans, asserting zero warm S3 GETs.
+test-mount-cache *args:
+    bash scripts/mount_cache_test.sh {{args}}
 
 # Publish a new immutable snapshot, then move a ref at it. Writes go
 # direct to S3 (never via the mount); reads resolve mount paths.

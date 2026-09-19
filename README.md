@@ -18,15 +18,14 @@ OSM Layercake GeoParquet (HTTPS)
                                └─ Arrow Flight → native DuckDB Arrow batches
 ```
 
-One binary, three commands, one snapshot. Apache-2.0. DuckDB 2.0 nightly
-(`v2.0.0-alpha42069`; see `scripts/duckdb_version.py` for the exact pin),
-accessed exclusively through the stable v2 C API.
+One binary, three commands, one snapshot. Apache-2.0. DuckDB 2.0 via the
+`duckdb-go v2.20000.0-6.preview` binding (CGO; preview until the 2.0 GA).
 
 One binary, three commands (`build`, `index`, `serve`), one shard. Apache-2.0.
 
 ## Quickstart
 
-Install stable Rust with rustup and `just` with `mise install`, then:
+Install Go 1.25+ and `just` with `mise install`, then:
 
 ```sh
 just fixture-osm --limit 20000    # Layercake buildings, central Berlin
@@ -41,17 +40,14 @@ curl 'localhost:3000/collections/buildings/items?bbox=13.395,52.515,13.405,52.52
 # Human-readable API documentation: http://localhost:3000/api.html
 ```
 
-The recipes configure the prebuilt DuckDB library. For direct Cargo commands:
+The DuckDB 2.0 library is bundled by the Go binding (CGO). For direct commands:
 
 ```sh
-just setup-duckdb
-export DUCKDB_LIB_DIR="$PWD/.deps/duckdb"
-export LD_LIBRARY_PATH="$DUCKDB_LIB_DIR"       # macOS: DYLD_LIBRARY_PATH
-cargo run --locked -- build \
+go run ./cmd/lakewing build \
   --from https://data.openstreetmap.us/layercake/buildings.parquet \
   --collection buildings --bbox=13.35,52.48,13.45,52.55 \
   --out fixtures/berlin.ducklake --data-dir fixtures/berlin.files
-cargo run --locked --release -- serve --shard fixtures/berlin.ducklake
+go run ./cmd/lakewing serve --shard fixtures/berlin.ducklake
 ```
 
 ## Materialization
@@ -91,10 +87,10 @@ snapshot and restart `serve --shard NEW_CATALOG` to switch. The serving
 host needs the matching DuckDB `spatial`/`ducklake` extensions installed;
 `build` installs them automatically. `--data-url` records the
 zone-independent data root in the catalog (an `s3://` prefix for lake
-publishes; defaults to the local data dir); each reader overrides it with
-`serve --data-base` (repeat once per Cachey shard) pointing at its zone's
-Cachey, so relative Parquet paths resolve AZ-local everywhere with stable
-shard ownership. `build --content-address` names data files by content
+publishes; defaults to the local data dir); each reader mounts the bucket
+(via mountpoint S3 CSI) and passes `serve --data-root` pointing at the
+mount's data prefix, so relative Parquet paths resolve to local mount paths
+everywhere. `build --content-address` names data files by content
 hash so unchanged snapshots upload nothing new, and every build writes a
 `<catalog>.serving.json` spatial file index beside the catalog (`index`
 recompiles it for older catalogs).
@@ -106,19 +102,21 @@ just workloads                    # saved deterministic request sets
 ```
 
 `just workloads` writes hot, urban, rural, scattered, broad, empty, deep and
-mixed URL sets for `bench-http --workload`; regenerate with `--region` for a
+mixed URL sets for `ogc_bench.py --workload`; regenerate with `--region` for a
 different shard extent.
 
 ### Serving from S3
 
-`serve --shard` takes a local `.ducklake` catalog path or the HTTP(S)/`s3://`
-URL of a published catalog and attaches it read-only. For private S3,
-prefer a short-lived presigned HTTPS object URL; the binary deliberately does
-not accept cloud credentials. In production the catalog stores a
-zone-independent `s3://` data root and each reader passes `--data-base`
-with its zone's Cachey `/fetch/` prefix, so all storage reads are range
-GETs through the zone-shared page cache (see
-[`docs/cachey-lake.md`](docs/cachey-lake.md)).
+Reads go through a mountpoint-S3 mount, never through HTTP or SDK range
+GETs issued by the server. `serve --shard` takes a mount path to the
+`.ducklake` catalog (e.g. `/mnt/lake/catalogs/<sha>.ducklake`) and
+`--data-root` takes the mount's data prefix; the catalog attaches read-only
+and the stored zone-independent `s3://` data root is remapped to those
+local paths. Writes (build/publish) go direct to the S3 API and never
+through the mount. In production the mount comes from the mountpoint S3 CSI
+driver with a node-local disk cache (see [`docs/mount-lake.md`](docs/mount-lake.md));
+locally, `just seaweed-up` + `just lake-mount` reproduce it with SeaweedFS
+and `mount-s3 --cache`.
 Every pooled connection is switched to the attached catalog; serving reads
 resolve at startup to a frozen `read_parquet` file list over the exact
 files live at the pinned snapshot, pruned per request to candidate files
@@ -185,10 +183,6 @@ Unknown or duplicate columns are rejected. Empty streams include their schema.
 
 DuckDB produces native Arrow batches, which are encoded directly for Flight without a result cache. A bounded query result is materialized before transmission. The service provides read-only Flight with JSON tickets.
 
-```sh
-cargo run --locked --example flight_client
-```
-
 ## Bulk access
 
 Bulk consumers use Arrow Flight (same pinned snapshot, bulk admission
@@ -209,10 +203,10 @@ lane. `--threads` sets shared DuckDB threads for the whole process
 (default 1; keep at 1 for many small concurrent queries, raise only with
 fewer connections for bulk) and `--memory-mb` caps shared DuckDB memory in
 MiB (default 4096, sized for the ~10 GB shard urban working set; 0 leaves
-DuckDB's unbounded default). Parquet/HTTP block and metadata caching lives
-in Cachey, the per-zone page cache readers fetch through, not in DuckDB:
+DuckDB's unbounded default). Repeated Parquet block reads are absorbed by
+the mountpoint local disk cache on each node, not by in-DuckDB tuning:
 there are no storage-tuning flags by design (see
-[`docs/cachey-lake.md`](docs/cachey-lake.md)).
+[`docs/mount-lake.md`](docs/mount-lake.md)).
 `--query-timeout-ms` interrupts HTTP and Flight
 queries past their deadline (default 30000; 0 disables). Queries run on blocking
 workers with one bounded lifecycle: cancellation is owned from before
@@ -224,36 +218,31 @@ per-stream byte budget (`--flight-stream-mb`, default 32) plus a process-wide
 budget (`--flight-total-mb`, default 128). Narrow scans fetch page payloads
 late via file/row-number instead of reading geom+properties first. `/metrics`
 is `no-store` and reports `http_requests` plus `duck_setting_*` engine
-budgets (threads, memory). Storage-cache benchmarks now live in Cachey
-instead: see [`docs/cachey-lake.md`](docs/cachey-lake.md) for the local rig
-(`just cachey-up`, `just lake-publish`, `just lake-serve`).
+budgets (threads, memory). Storage-cache benchmarks measure the mountpoint
+local disk cache instead: see [`docs/mount-lake.md`](docs/mount-lake.md) for
+the local rig (`just seaweed-up`, `just lake-mount`, `just lake-publish`,
+`just lake-serve`).
 Error responses are always `Cache-Control: no-store` and carry no ETag.
 
-GeoJSON embeds DuckDB's geometry/properties text without a Rust-side
+GeoJSON embeds DuckDB's geometry/properties text without a server-side
 re-parse, and every response carries an `ETag` with
 `Cache-Control: public, max-age=60` (`If-None-Match` returns 304). ETags
 are content hashes over the exact bytes, and gzip variants are compressed
 per request with their own strong ETag; MVT tiles are already compact and
-skip compression. Repeated storage reads are absorbed by the zone-shared
-Cachey layer, not by per-pod memory.
+skip compression. Repeated storage reads are absorbed by the node-local
+mountpoint disk cache, not by per-pod memory.
 
-Use a release server. The compiled HTTP client warms up before its timed
+Use a release build. `scripts/ogc_bench.py` warms up before its timed
 phase, counts successful responses separately from overload/errors, consumes
-complete responses, and reports returned data. Prefer `--passes N
---workload FILE` (identical complete passes on every backend) over
-`--duration` (different duration-sliced prefixes are not comparable):
+complete responses, and reports returned data. Prefer fixed `--requests`
+with `--workload FILE` (identical complete passes on every backend) over
+ad-hoc URLs:
 
 ```sh
-just bench-matrix base=http://127.0.0.1:3000 dir=workloads/nw-europe passes=2
-CONC=8 DUR=15 just bench-http -- --warmup-secs 3
-CONC=32 DUR=15 just bench-http -- --warmup-secs 3
-CONC=8 DUR=15 just bench-http -- --jitter --seed 1
-CONC=8 DUR=15 just bench-http -- --jitter --seed 2
-CONC=8 DUR=15 just bench-http -- --gzip
-CONC=32 DUR=15 just bench-http -- --route tiles
-CONC=32 REQ=100 just bench-flight --limit 1000
-CONC=8 REQ=100 just bench-flight --jitter --limit 1000
-just bench-workloads dir=workloads/nw-europe
+just bench-ogc-matrix
+CONC=8 just bench-ogc -- --jitter --seed 1
+CONC=32 just bench-ogc -- --jitter --seed 2
+CONC=32 just bench-ogc -- --route tiles
 ```
 
 Use a fresh `--seed` per jitter run: every request in a run is unique and
@@ -276,19 +265,19 @@ discarded rows than `OFFSET` (verified 3.5x on full-region pages at offset
 Snapshots are immutable, so scale past one CPU by running one instance per
 core group against the same catalog. Each replica keeps its own pool:
 budget roughly one `--connections` pool (8 DuckDB threads at one thread
-each) per instance, with repeated storage reads shared zone-wide through
-Cachey, and confirm with `bench-http` round-robining across replicas
-versus one instance:
+each) per instance, with repeated storage reads shared node-wide through
+the mountpoint disk cache, and confirm with `ogc_bench.py` round-robining
+across replicas versus one instance:
 
 ```sh
-BASE=http://127.0.0.1:3010,http://127.0.0.1:3012 CONC=8 DUR=15 just bench-http -- --jitter --seed 2
+python3 scripts/ogc_bench.py --base http://127.0.0.1:3010 --concurrency 8 --requests 100 --jitter --seed 2
 ```
 
 On the 20k Berlin fixture, loopback, two 4-connection replicas served
 jittered misses at ~720 rps against ~350 rps for one 8-connection instance
-at equal totals (measured before the app-cache removal; the scaling shape
-— replicas add DuckDB throughput, Cachey shares storage reads — still
-applies).
+at equal totals (measured in the Rust/Cachey era; the scaling shape
+— replicas add DuckDB throughput, the shared cache absorbs storage reads —
+still applies).
 
 Reference loopback run on the 5.17 GB / 14.985M-feature single-file Layercake
 shard (DuckDB 1.5.5 era, before the DuckLake-only rewrite; kept for scale
@@ -314,7 +303,5 @@ miss-path HTTP runs 56 vs 54 rps and 1,000-row Flight runs 40 vs 41 rps
 These are not universal capacity claims; run the included tools on the target
 CPU, storage, shard size and response shape.
 
-`just check test` runs Clippy and real-DuckDB regressions for materialization,
-geometry/lineage agreement between protocols, pagination, request validation,
-Flight discovery and empty schemas, tile coordinate isolation and Mercator
-encoding, read-only operation, overload and cancellation.
+`just check test` runs gofmt, `go vet` and the Go unit suites (filter,
+plan, index, Flight ticket validation).

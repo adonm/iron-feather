@@ -3,23 +3,22 @@ on:
   push:
   pull_request:
 jobs:
-  rust:
+  go:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
         with:
-          components: rustfmt, clippy
-      - run: just fmt-check check test
-  stack:
-    # Real-stack coverage: synthetic 262k-feature catalog on MinIO, served
-    # through Cachey by real server processes. No mocks, exact asserts.
+          go-version: "1.25"
+      - run: sudo apt-get update && sudo apt-get install -y build-essential
+      - run: gofmt -l cmd internal
+      - run: go vet ./...
+      - run: go test ./...
+  chart:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-      - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y rclone
-      - run: just test-stack
+      - run: helm lint charts/lakewing
+      - run: helm template lake charts/lakewing --set catalog=sha_test.ducklake > /dev/null

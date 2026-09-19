@@ -2,9 +2,9 @@
 {{- /* Optional single writer (the only component allowed to mutate refs):
      hourly build of a new immutable snapshot into scratch, upload of data
      + catalog to S3, then the ref move. Disabled by default.
-     The build stores a zone-independent s3:// DATA_PATH; readers override
-     it per zone via --data-base, so no zone reads through another zone's
-     Cachey. Uploads are additive (copy, never sync/delete); catalog keys
+     The build stores a zone-independent s3:// DATA_PATH; readers mount the
+     bucket and pass it as --data-root, so every zone reads local paths.
+     Uploads are additive (copy, never sync/delete); catalog keys
      are never overwritten (the job fails if the key exists). */ -}}
 {{- $wzone := .Values.zones | first }}
 {{- $endpoint := .Values.s3endpoint | default "http://seaweedfs:8333" }}
