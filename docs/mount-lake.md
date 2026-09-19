@@ -68,6 +68,26 @@ new S3 GETs, 2.2x faster even on loopback. Wiping the cache resumes S3
 reads, proving warm hits came from disk. Loopback excludes real network
 latency, so treat these as behavior validation, not capacity claims.
 
+## Serving off the mount (validated 2026-09-20)
+
+`lakewing serve` was run with `--shard`/`--data-root` on a real
+`mount-s3 --cache` mount of SeaweedFS (Berlin seed snapshot, OGC bbox page,
+`limit=100`):
+
+- Cold query: 100 features, 10 S3 GetObjects, ~7 MB into the disk cache.
+- Six repeat queries: all byte-identical, no further GetObject lines in
+  the mount metrics across ~40 s of 5 s flushes.
+- S3 outage with default 60 s metadata TTL: queries hang revalidating
+  metadata (Head/List) until the server's query timeout interrupts —
+  **data blocks are cached, metadata is not**.
+- S3 outage with `--metadata-ttl indefinite`: byte-identical 200s with S3
+  fully down.
+
+Snapshots are immutable, so metadata never changes: production mounts
+should set indefinite metadata TTL (see the `csi.mountOptions` note in
+`charts/lakewing/values.yaml`). That plus the disk cache makes warmed
+readers S3-outage-proof for cached data.
+
 > Host note: this dev host denies FUSE mounts (`fusermount3: Operation not
 > permitted`), so the test mounts inside a throwaway `--privileged`
 > container running the same `mount-s3` binary against the same SeaweedFS.
