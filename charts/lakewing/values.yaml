@@ -1,0 +1,74 @@
+# Read pool over the CSI-mounted lake. Readers are plain POSIX clients of
+# their node's mountpoint-S3-CSI mount: no Cachey, no HTTP range secrets,
+# no --data-base sharding. Writes (build/publish) go direct to S3.
+image:
+  repository: lakewing
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# S3 bucket holding catalogs/, data/ and refs/. Only the writer talks to
+# S3 over the API; readers only ever open mount paths.
+s3bucket: lake
+
+# Concrete published catalog readers pin to (restart/rollout to move).
+# Written by the seed job or the writer; see refs/ in S3 for history.
+catalog: sha_berlin.ducklake
+
+# One Deployment per zone; each pod mounts the bucket via the
+# mountpoint-S3-CSI driver, so the page cache is shared node-wide.
+replicasPerZone: 1
+zones:
+  - az-a
+  - az-b
+resources: {}
+#  requests:
+#    memory: 5Gi
+#    cpu: "2"
+
+service:
+  port: 3000
+
+# S3 key prefix holding the immutable Parquet data files. The published
+# catalog stores `s3://<bucket>/<dataPrefix>/` as its DATA_PATH; readers
+# mount the bucket at mountPath and pass --data-root, so the same
+# snapshot serves local paths everywhere. The writer builds with the
+# same prefix.
+dataPrefix: data
+
+# Static-provisioned mountpoint-S3-CSI volume. The cluster must have the
+# driver installed (s3.csi.aws.com); authentication via driver-level IRSA,
+# Pod Identity, or csi.storageSecretName. prefix scopes the mount when one
+# bucket hosts several lakes.
+csi:
+  driver: s3.csi.aws.com
+  volumeHandle: lake
+  mountPath: /mnt/lake
+  prefix: ""
+  storageClass: lakewing-mount
+  authenticationSource: driver
+  storageSecretName: ""
+
+# S3 endpoint + Secret for the writer/seed direct-write sidecars.
+# Defaults address the local SeaweedFS rig (see just seaweed-up); point at
+# real S3 in prod.
+s3endpoint: ""
+s3secret: ""
+
+# Dedicated bulk pool (Flight + heavy OGC) pinned to the same catalog.
+# Disabled by default: enable when bulk scans threaten interactive pages.
+bulk:
+  enabled: false
+  replicasPerZone: 1
+  flightConcurrency: 0
+  connections: 4
+  resources: {}
+
+# Optional single writer: hourly build + S3 upload + ref move (the ETL
+# publisher). The only component allowed to mutate refs. Needs the S3
+# Secret for direct writes.
+writer:
+  enabled: false
+  schedule: "0 * * * *"
+  bbox: 13.35,52.48,13.45,52.55
+  limit: 20000
+  collection: buildings

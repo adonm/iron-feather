@@ -1,0 +1,38 @@
+{{- /* Static-provisioned mountpoint-S3-CSI volume for the lake bucket.
+     Readers mount this; writers never mount (direct S3 writes). */ -}}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "lakewing.fullname" . }}-lake
+spec:
+  capacity:
+    storage: 1200Gi
+  accessModes:
+    - ReadOnlyMany
+  mountOptions:
+    - allow-other
+  csi:
+    driver: {{ .Values.csi.driver }}
+    volumeHandle: {{ .Values.csi.volumeHandle }}
+    volumeAttributes:
+      bucketName: {{ .Values.s3bucket }}
+      {{- if .Values.csi.prefix }}
+      prefix: {{ .Values.csi.prefix }}
+      {{- end }}
+      authenticationSource: {{ .Values.csi.authenticationSource }}
+      {{- if .Values.csi.storageSecretName }}
+      csi.storageSecretName: {{ .Values.csi.storageSecretName }}
+      {{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "lakewing.fullname" . }}-lake
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: {{ .Values.csi.storageClass | quote }}
+  resources:
+    requests:
+      storage: 1200Gi
+  volumeName: {{ include "lakewing.fullname" . }}-lake

@@ -1,6 +1,0 @@
-dependencies:
-- name: cachey
-  repository: file://../cachey
-  version: 0.1.0
-digest: sha256:437f0795454a59c517f57549d462d2092f2b54f313b6a15165fe0b3a822e15be
-generated: "2026-09-17T08:12:21.365984806+08:00"

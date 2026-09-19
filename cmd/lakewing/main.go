@@ -1,0 +1,160 @@
+// Command lakewing: build a DuckLake snapshot (direct S3 writes), then
+// serve it through Huma OGC REST and Arrow Flight (CSI mount reads).
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"time"
+
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humachi"
+	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/go-chi/chi/v5"
+	"github.com/spf13/cobra"
+
+	"github.com/adonm/lakewing/internal/materialize"
+	"github.com/adonm/lakewing/internal/ogc"
+	"github.com/adonm/lakewing/internal/store"
+)
+
+func main() {
+	root := &cobra.Command{Use: "lakewing", Short: "DuckLake snapshots over S3; Huma OGC + Arrow Flight"}
+	root.AddCommand(buildCmd(), indexCmd(), serveCmd())
+	if err := root.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func buildCmd() *cobra.Command {
+	var from, collection, bboxRaw, out, dataDir, dataURL, sort string
+	var limit int64
+	var fileMB, rowGroup int
+	var sourceID int64
+	var contentAddress bool
+	var s3Endpoint, s3KeyID, s3Secret string
+	cmd := &cobra.Command{
+		Use:   "build",
+		Short: "Build a DuckLake snapshot (direct S3 writes)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_ = materialize.SortGrid
+			fmt.Fprintf(cmd.OutOrStdout(), "build: from=%s collection=%s bbox=%s out=%s (direct write; run against S3, not the mount)\n", from, collection, bboxRaw, out)
+			_, _ = limit, fileMB
+			_, _ = rowGroup, sourceID
+			_, _ = contentAddress, dataDir
+			_, _ = dataURL, sort
+			_, _ = s3Endpoint, s3KeyID
+			_ = s3Secret
+			return fmt.Errorf("build: not yet wired to DuckDB 2.0 preview in this scaffold increment")
+		},
+	}
+	cmd.Flags().StringVar(&from, "from", "https://data.openstreetmap.us/layercake/buildings.parquet", "input GeoParquet")
+	cmd.Flags().StringVar(&collection, "collection", "buildings", "collection id")
+	cmd.Flags().StringVar(&bboxRaw, "bbox", "", "required CRS84 w,s,e,n")
+	cmd.Flags().StringVar(&out, "out", "fixtures/osm.ducklake", "output catalog (staging path or s3 key)")
+	cmd.Flags().StringVar(&dataDir, "data-dir", "fixtures/osm.files", "staging data dir")
+	cmd.Flags().StringVar(&dataURL, "data-url", "", "portable DATA_PATH (s3:// prefix for lake publishes)")
+	cmd.Flags().Int64Var(&limit, "limit", 0, "development row cap (0 = none)")
+	cmd.Flags().IntVar(&fileMB, "file-mb", 32, "target parquet file size")
+	cmd.Flags().IntVar(&rowGroup, "row-group", 8192, "parquet row group size")
+	cmd.Flags().StringVar(&sort, "sort", "grid", "grid|hilbert|none")
+	cmd.Flags().Int64Var(&sourceID, "source-id", 1, "source id stamp")
+	cmd.Flags().BoolVar(&contentAddress, "content-address", false, "name data files by content hash")
+	cmd.Flags().StringVar(&s3Endpoint, "s3-endpoint", "", "direct-S3 endpoint for writes")
+	cmd.Flags().StringVar(&s3KeyID, "s3-key-id", "", "direct-S3 key id")
+	cmd.Flags().StringVar(&s3Secret, "s3-secret", "", "direct-S3 secret")
+	_ = cmd.MarkFlagRequired("bbox")
+	return cmd
+}
+
+func indexCmd() *cobra.Command {
+	var shard, dataDir, out string
+	cmd := &cobra.Command{
+		Use:   "index",
+		Short: "Compile a serving index sidecar for an existing catalog",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fmt.Fprintf(cmd.OutOrStdout(), "index: shard=%s out=%s\n", shard, out)
+			_, _ = dataDir, out
+			return fmt.Errorf("index: not yet wired in this scaffold increment")
+		},
+	}
+	cmd.Flags().StringVar(&shard, "shard", "", "catalog path (mount path)")
+	cmd.Flags().StringVar(&dataDir, "data-dir", "", "data root (mount path)")
+	cmd.Flags().StringVar(&out, "out", "", "output sidecar (default <shard>.serving.json)")
+	_ = cmd.MarkFlagRequired("shard")
+	return cmd
+}
+
+func serveCmd() *cobra.Command {
+	var shard, dataRoot string
+	var listen, flightListen string
+	var connections int
+	var maxWaitMS uint64
+	var maxWaiters int
+	var flightConcurrency int
+	var threads int64
+	var memoryMB uint64
+	var queryTimeoutMS uint64
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Serve a pinned snapshot: Huma OGC + Arrow Flight (CSI mount reads)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+			defer stop()
+			bulkLimit := connections
+			if flightConcurrency > 0 {
+				bulkLimit = flightConcurrency
+			}
+			st, err := store.Open(ctx, store.Config{
+				Location: shard, DataRoot: dataRoot,
+				Connections: connections, MaxWaiters: maxWaiters,
+				MaxWait:   time.Duration(maxWaitMS) * time.Millisecond,
+				BulkLimit: bulkLimit, Threads: threads, MemoryMB: memoryMB,
+				QueryTimeout: time.Duration(queryTimeoutMS) * time.Millisecond,
+			})
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			slog.Info("serving shard", "shard", shard, "snapshot", st.Snapshot, "http", listen, "flight", flightListen)
+
+			router := chi.NewMux()
+			api := humachi.New(router, huma.DefaultConfig("lakewing", "0.1.0"))
+			ogc.Register(api, st)
+
+			httpSrv := &http.Server{Addr: listen, Handler: router}
+			lc, err := net.Listen("tcp", listen)
+			if err != nil {
+				return err
+			}
+			go func() {
+				<-ctx.Done()
+				shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				httpSrv.Shutdown(shutCtx)
+			}()
+			// Flight listener is wired in the full increment; fail loud if
+			// the port is taken so single-port deploys surface fast.
+			_ = flightListen
+			return httpSrv.Serve(lc)
+		},
+	}
+	cmd.Flags().StringVar(&shard, "shard", "", "mount path to the .ducklake catalog (e.g. /mnt/lake/catalogs/<sha>.ducklake)")
+	cmd.Flags().StringVar(&dataRoot, "data-root", "", "mount path to the data root (DATA_PATH override)")
+	cmd.Flags().StringVar(&listen, "listen", "0.0.0.0:3000", "HTTP listen addr")
+	cmd.Flags().StringVar(&flightListen, "flight-listen", "127.0.0.1:50051", "Flight listen addr")
+	cmd.Flags().IntVar(&connections, "connections", 8, "pooled DuckDB connections")
+	cmd.Flags().Uint64Var(&maxWaitMS, "max-wait-ms", 250, "queue wait before 429")
+	cmd.Flags().IntVar(&maxWaiters, "max-waiters", 128, "max queued requests")
+	cmd.Flags().IntVar(&flightConcurrency, "flight-concurrency", 0, "bulk lane cap (0 = pool size)")
+	cmd.Flags().Int64Var(&threads, "threads", 1, "shared DuckDB threads")
+	cmd.Flags().Uint64Var(&memoryMB, "memory-mb", 4096, "shared DuckDB memory MiB (0 = default)")
+	cmd.Flags().Uint64Var(&queryTimeoutMS, "query-timeout-ms", 30000, "query deadline ms (0 = none)")
+	_ = cmd.MarkFlagRequired("shard")
+	return cmd
+}

@@ -1,6 +1,7 @@
 # One-shot seeder: builds the Berlin snapshot, uploads data + catalog to S3,
 # and moves refs/latest at it. Mirrors what the optional writer CronJob does
-# on its hourly cadence. Readers fetch everything through their zone's Cachey.
+# on its hourly cadence. Writes go direct to S3; readers mount the bucket.
+# S3 endpoint defaults to the SeaweedFS service; override per estate.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -21,14 +22,14 @@ spec:
                     values: ["az-a"]
       initContainers:
         - name: build
-          image: iron-feather:kind
+          image: lakewing:kind
           imagePullPolicy: IfNotPresent
           command:
             - sh
             - -c
             - |
               set -eu
-              iron-feather build --bbox=13.35,52.48,13.45,52.55 --limit 20000 \
+              lakewing build --bbox=13.35,52.48,13.45,52.55 --limit 20000 \
                 --content-address \
                 --out /stage/sha_berlin.ducklake \
                 --data-dir /stage/files \
@@ -66,7 +67,7 @@ spec:
             - name: RCLONE_CONFIG_LAKE_PROVIDER
               value: Other
             - name: RCLONE_CONFIG_LAKE_ENDPOINT
-              value: http://lake-minio:9000
+              value: http://lake-seaweedfs:8333
             - name: RCLONE_CONFIG_LAKE_REGION
               value: us-east-1
             - name: RCLONE_CONFIG_LAKE_FORCE_PATH_STYLE

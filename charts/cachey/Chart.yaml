@@ -1,7 +1,0 @@
-apiVersion: v2
-name: cachey
-description: Per-zone read-through page cache for S3 (readers share one per zone; pods fetch Parquet ranges over HTTP)
-type: application
-version: 0.1.0
-# Images are pinned by digest in values.images; refresh deliberately.
-appVersion: latest
